@@ -1028,6 +1028,7 @@ pub struct TimelockMinDelaySet {
 #[repr(u32)]
 pub enum SchemaVersion {
     V1 = 1,
+    V2 = 2,
 }
 
 #[contractevent(topics = ["schema", "upgrade"])]
@@ -1091,6 +1092,8 @@ pub enum DataKey {
     /// Tracks the last-opened timestamp for a reporter_hash/proof pair.
     /// Key is the caller-supplied `reporter_hash` (a 32-byte commitment).
     ReporterCooldown(BytesN<32>),
+    /// Scoped nullifier separated by verifier address context (#325).
+    VerifierNullifier(Address, BytesN<32>),
 }
 
 #[contracterror]
@@ -1271,25 +1274,33 @@ impl HarpocratesRegistry {
             .get(&DataKey::SchemaVersion)
             .unwrap_or(SchemaVersion::V1 as u32);
 
-        let target_version = SchemaVersion::V1 as u32;
+        let target_version = SchemaVersion::V2 as u32;
 
         // Legacy pre-#85 registries: stamp V1 without a SchemaUpgraded event.
         if !had_version {
             env.storage()
                 .persistent()
-                .set(&DataKey::SchemaVersion, &target_version);
-            return;
+                .set(&DataKey::SchemaVersion, &(SchemaVersion::V1 as u32));
+            // Current version conceptually becomes V1 here
         }
 
-        if current_version < target_version {
+        let actual_current = if !had_version {
+            SchemaVersion::V1 as u32
+        } else {
+            current_version
+        };
+
+        if actual_current < target_version {
             // Migrations will be added here when moving to V2, V3, etc.
+            // V1 -> V2: Domain-separated nullifiers by verifier context (#325).
+            // Legacy nullifiers are preserved, so no iterative key rewrite is required.
 
             env.storage()
                 .persistent()
                 .set(&DataKey::SchemaVersion, &target_version);
 
             SchemaUpgraded {
-                previous: current_version,
+                previous: actual_current,
                 current: target_version,
             }
             .publish(&env);
@@ -1801,11 +1812,8 @@ impl HarpocratesRegistry {
         require_domain_unpaused(&env, PAUSE_DOMAIN_TIER1_REGISTRATION);
         require_unique(&env, &proof_id, &video_hash);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier.clone()))
-        {
+        let verifier = get_active_verifier(&env);
+        if Self::has_nullifier(env.clone(), verifier.clone(), nullifier.clone()) {
             panic_with_error!(&env, RegistryError::DuplicateNullifier);
         }
 
@@ -1816,7 +1824,7 @@ impl HarpocratesRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, nullifier.clone()), &true);
 
         let expires_at = compute_expires_at(&env);
         let record = ProofRecord {
@@ -1865,19 +1873,16 @@ impl HarpocratesRegistry {
                 panic_with_error!(&env, RegistryError::StaleEpoch);
             }
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
-                panic_with_error!(&env, RegistryError::DuplicateNullifier);
-            }
-
             let verifier: Address = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Verifier)
                 .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+            if Self::has_nullifier(env.clone(), verifier.clone(), parsed.nullifier.clone()) {
+                panic_with_error!(&env, RegistryError::DuplicateNullifier);
+            }
+
             if proof.is_empty() {
                 panic_with_error!(&env, RegistryError::InvalidProof);
             }
@@ -1887,7 +1892,7 @@ impl HarpocratesRegistry {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -1918,19 +1923,16 @@ impl HarpocratesRegistry {
             }
             require_active_credential_root(&env, &parsed.credential_root);
 
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-            {
-                panic_with_error!(&env, RegistryError::DuplicateNullifier);
-            }
-
             let verifier: Address = env
                 .storage()
                 .persistent()
                 .get(&DataKey::Verifier)
                 .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+            if Self::has_nullifier(env.clone(), verifier.clone(), parsed.nullifier.clone()) {
+                panic_with_error!(&env, RegistryError::DuplicateNullifier);
+            }
+
             if proof.is_empty() {
                 panic_with_error!(&env, RegistryError::InvalidProof);
             }
@@ -1940,7 +1942,7 @@ impl HarpocratesRegistry {
 
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
             let expires_at = compute_expires_at(&env);
             save_record(
@@ -2086,16 +2088,24 @@ impl HarpocratesRegistry {
             }
 
             // Check nullifier uniqueness.
-            if env
+            let verifier: Address = env
                 .storage()
                 .persistent()
-                .has(&DataKey::Nullifier(element.nullifier.clone()))
-            {
+                .get(&DataKey::Verifier)
+                .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+            if Self::has_nullifier(env.clone(), verifier.clone(), element.nullifier.clone()) {
                 panic_with_error!(&env, RegistryError::DuplicateNullifier);
             }
         }
 
         // All checks passed — persist every element.
+        let verifier: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verifier)
+            .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
         for i in 0..batch_size {
             let element = &parsed.elements[i as usize];
             let video_hash = video_hashes.get(i).unwrap();
@@ -2104,7 +2114,7 @@ impl HarpocratesRegistry {
             // Consume the nullifier.
             env.storage()
                 .persistent()
-                .set(&DataKey::Nullifier(element.nullifier.clone()), &true);
+                .set(&DataKey::VerifierNullifier(verifier.clone(), element.nullifier.clone()), &true);
 
             let record = save_record(
                 &env,
@@ -2737,10 +2747,12 @@ impl HarpocratesRegistry {
         proof_id.and_then(|id| env.storage().persistent().get(&DataKey::Proof(id)))
     }
 
-    pub fn has_nullifier(env: Env, nullifier: BytesN<32>) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::Nullifier(nullifier))
+    pub fn has_nullifier(env: Env, verifier: Address, nullifier: BytesN<32>) -> bool {
+        if env.storage().persistent().has(&DataKey::VerifierNullifier(verifier, nullifier.clone())) {
+            true
+        } else {
+            env.storage().persistent().has(&DataKey::Nullifier(nullifier))
+        }
     }
 
     pub fn get_issuer(env: Env, issuer: Address) -> Option<IssuerRecord> {
@@ -3081,19 +3093,16 @@ impl HarpocratesRegistry {
 
         require_active_credential_root(&env, &parsed.credential_root);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
-
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+        if Self::has_nullifier(env.clone(), verifier.clone(), parsed.nullifier.clone()) {
+            panic_with_error!(&env, RegistryError::DuplicateNullifier);
+        }
+
         if proof.is_empty() {
             panic_with_error!(&env, RegistryError::InvalidProof);
         }
@@ -3103,7 +3112,7 @@ impl HarpocratesRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         NonRevocationChecked {
             credential_root: parsed.credential_root,
@@ -3384,19 +3393,16 @@ impl HarpocratesRegistry {
 
         require_active_credential_root(&env, &parsed.credential_root);
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Nullifier(parsed.nullifier.clone()))
-        {
-            panic_with_error!(&env, RegistryError::DuplicateNullifier);
-        }
-
         let verifier: Address = env
             .storage()
             .persistent()
             .get(&DataKey::Verifier)
             .unwrap_or_else(|| panic_with_error!(&env, RegistryError::VerifierNotSet));
+
+        if Self::has_nullifier(env.clone(), verifier.clone(), parsed.nullifier.clone()) {
+            panic_with_error!(&env, RegistryError::DuplicateNullifier);
+        }
+
         if proof.is_empty() {
             panic_with_error!(&env, RegistryError::InvalidProof);
         }
@@ -3406,7 +3412,7 @@ impl HarpocratesRegistry {
 
         env.storage()
             .persistent()
-            .set(&DataKey::Nullifier(parsed.nullifier.clone()), &true);
+            .set(&DataKey::VerifierNullifier(verifier, parsed.nullifier.clone()), &true);
 
         SelectiveDisclosureVerified {
             schema_hash: parsed.schema_hash,
