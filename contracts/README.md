@@ -156,6 +156,10 @@ in the sequential branch inside `upgrade_storage`, preserve existing proof /
 video / nullifier records, and must never log media, secrets, witnesses, or
 private keys.
 
+A V1 wasm presented with a stored version greater than V1 leaves that version
+and the rest of storage untouched; it does not attempt a downgrade. Operators
+must use a wasm that supports the stored schema version.
+
 Rollback is redeploying a prior wasm: additive `SchemaVersion` keys are
 ignored by older readers, and no proof rewrite is required for the V1 stamp.
 Operators should call `get_storage_schema_version` after upgrade to confirm
@@ -248,6 +252,10 @@ get_proof
 get_by_video
 has_nullifier
 get_issuer
+rotate_issuer
+finalize_issuer_rotation
+get_issuer_rotation
+is_issuer_verifiable
 set_revocation_root
 get_revocation_root
 check_non_revocation
@@ -356,6 +364,8 @@ The registry emits typed Soroban events with `#[contractevent]`:
 ["proof", "revoke", proof_id]     => status
 ["issuer", "add", issuer]         => metadata_hash
 ["issuer", "revoke", issuer]      => {}
+["issuer", "rotate", previous_issuer] => replacement_issuer, rotated_at, grace_expires_at, grace_secs
+["issuer", "grace", issuer]       => replacement_issuer, grace_expires_at
 ["verif", "set", verifier]        => {}
 ["credroot", "add", root]         => metadata_hash, issued_at
 ["credroot", "revoke", root]      => {}
@@ -457,6 +467,33 @@ redeploy.
 
 See [DISPUTE.md](DISPUTE.md) for the state machine, error codes, threat notes,
 and migration/rollback details.
+
+## Contract Error ABI (#344)
+
+`contracts/ERROR_ABI.md` publishes the stable error ABI (`hpx-err/1`) for
+`RegistryError`: every discriminant, its variant name, its failure class
+(`malformed`, `oversized`, `expired`, `revoked`, `unsupported`, `dependency`,
+plus `auth`, `conflict`, `resource`, `state`), and whether the same call may be
+retried once an external condition clears.
+
+Codes `1..=80` are frozen and append-only: a new failure takes the next unused
+number, and an existing code is never renumbered or reused. The ABI describes
+revert values only. It adds no storage keys, changes no entrypoint signature,
+and requires no migration.
+
+Failure responses stay privacy-safe: a revert is reported as a code, never as a
+dump of the offending input. Proof bytes, public inputs, witnesses, nullifiers,
+media, credentials, signatures, and private keys are never part of an error and
+never logged, and a rejected call still emits no lifecycle event.
+
+`contracts/harpocrates-registry/src/test_error_abi.rs` reads the document at
+compile time and fails if a variant is renamed, renumbered, dropped, duplicated,
+or assigned a class outside the documented set:
+
+```bash
+cd contracts
+cargo test -p harpocrates-registry error_abi -- --nocapture
+```
 
 ## Scripts
 
