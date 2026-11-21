@@ -153,6 +153,8 @@ HARPOCRATES_RELEASE_ID=harpocrates-1.0.0
 HARPOCRATES_RELEASE_NETWORK=testnet
 STELLAR_NETWORK_PASSPHRASE=
 HARPOCRATES_REGISTRATION_RECONCILE_DIR=/tmp/harpocrates-registration-reconcile
+HARPOCRATES_STORAGE_DIR=/tmp/harpocrates_jobs
+MASTER_ENCRYPTION_KEY=
 DATABASE_URL=postgresql://...
 VERIFIER_CACHE_MAX_SIZE=10000
 VERIFIER_CACHE_POSITIVE_TTL_SECONDS=86400.0
@@ -222,10 +224,26 @@ store = CheckpointStore(deployment=deployment)
 checkpoint = store.record(1_250)
 ```
 
+## Encrypted Blob Collection
+
+`evidence_storage.py` never removes an encrypted blob file until the metadata
+transaction has committed. `collect_unreferenced_blob()` locks the blob row,
+checks for committed `tenant_blob_refs`, deletes the `blobs` row, commits, and
+only then unlinks the ciphertext. A failed reference check or metadata deletion
+leaves the file in place and raises `StorageMetadataRetryableError` after a
+bounded number of attempts.
+
+`record_tenant_ref()` takes the same blob-row lock before writing a reference,
+so concurrent collection cannot classify an in-flight reference as unreferenced.
+Both operations reuse the existing `DB_CONNECT_MAX_ATTEMPTS`,
+`DB_CONNECT_DEADLINE_SECONDS`, and `DB_CONNECT_RETRY_BASE_SECONDS` retry budget.
+At an HTTP boundary, map the error to the existing `DEPENDENCY_UNAVAILABLE`
+(503) envelope.
+
 ## Test
 
 ```powershell
-python -m unittest test_app.py test_stego.py test_registration_reconcile.py
+python -m unittest test_app.py test_stego.py test_registration_reconcile.py test_evidence_storage.py
 ```
 
 The service uses temporary files while processing and does not persist uploaded
