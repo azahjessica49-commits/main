@@ -120,6 +120,23 @@ that cursor. Replayed projections are idempotent on `(tx_hash, event_index)`,
 so rows committed before a failed page retry are treated as duplicates. No
 additional configuration or database migration is required.
 
+## Upload Session Cancellation
+
+Upload sessions created by `POST /api/stego/upload-session` can be cancelled with
+`POST /api/stego/upload-session/<session_id>/cancel`. Cancellation is accepted
+while the session is queued, receiving chunks, or committing; terminal sessions
+return `409 UPLOAD_NOT_CANCELLABLE`, and unknown sessions return `404`.
+
+A queued admission ticket is released immediately. An active ticket moves to the
+`cancelling` state and is released when the in-flight chunk or commit request
+finishes. Cancellation removes the session's temporary directory only after all
+active writers stop, so a concurrent chunk never loses bytes mid-write. Further
+chunk, commit, or bounded-hash work on the cancelled session returns
+`409 UPLOAD_CANCELLED`.
+
+No additional environment variables are required; cancellation reuses the
+existing admission and upload settings.
+
 ## Upload and Verification Load Test
 
 With FFmpeg installed and a local testing backend running, execute a bounded
