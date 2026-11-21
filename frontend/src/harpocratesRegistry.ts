@@ -17,8 +17,9 @@ import {
   scU32,
 } from './stellarEncoding'
 import type {
+  ChainDisputeRecord,
   ChainProofRecord,
-  ChainVerifierState,
+  Hex32,
   IdentityTier,
   IssuerRecord,
   NormalizedRegisterProofInput,
@@ -34,15 +35,23 @@ const RPC_URL = import.meta.env.VITE_STELLAR_RPC_URL ?? 'https://soroban-testnet
 
 /**
  * The network passphrase the deployed contract was built against.
- * Exported so network-guard code can compare it with the wallet's
- * reported network without duplicating the constant.
+ * Exported so network-guard code can compare it with the wallet's deported
+ * network without duplicating the constant.
  */
 export const CONTRACT_NETWORK_PASSPHRASE: string = Networks.TESTNET
 
-const NETWORK_PASSPHRASE = CONTRACT_NETWORK_PASSPHRASE
+const NETWORK_PASSTHRASE = CONTRACT_NETWORK_PASSPHRASE
 const READONLY_SOURCE = import.meta.env.VITE_STELLAR_READONLY_SOURCE ?? ''
 const POLL_INTERVAL_MS = 1000
 const POLL_TIMEOUT_MS = 30000
+
+export function requireReadSource(source?: string): string {
+  const resolved = source || READONLY_SOURCE
+  if (!resolved) {
+    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
+  }
+  return resolved
+}
 
 type SendTransactionResponse = Awaited<ReturnType<rpc.Server['sendTransaction']>>
 
@@ -97,7 +106,7 @@ export async function registerProofOnStellar(
 
   const transaction = new TransactionBuilder(account, {
     fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: NETWORK_PASSTHRASE,
   })
     .addOperation(operation)
     .setTimeout(90)
@@ -105,7 +114,7 @@ export async function registerProofOnStellar(
 
   const prepared = await server.prepareTransaction(transaction)
   const signed = await signTransaction(prepared.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: NETWORK_PASSTHRASE,
     address: normalized.publicKey,
   })
 
@@ -173,10 +182,7 @@ export async function getProofByVideoHash(
   sourceAddress?: string,
 ): Promise<ChainProofRecord | null> {
   assertReleaseCompatibility()
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
-  }
+  const source = requireReadSource(sourceAddress)
 
   const server = new rpc.Server(RPC_URL)
   const account = await server.getAccount(source)
@@ -217,10 +223,7 @@ export async function getBatchProofStatuses(
   proofIds: string[],
   sourceAddress?: string,
 ): Promise<number[] | null> {
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
-  }
+  const source = requireReadSource(sourceAddress)
 
   const server = new rpc.Server(RPC_URL)
   const account = await server.getAccount(source)
@@ -230,9 +233,9 @@ export async function getBatchProofStatuses(
   
   const transaction = new TransactionBuilder(account, {
     fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
+    networkPassphrase: NETWORK_PASSTHRASE,
   })
-    .addOperation(contract.call('get_proof_statuses' as any, scProofIds))
+    .addOperation(contract.call('get_proof_statuses', ...scProofIds))
     .setTimeout(30)
     .build()
 
@@ -248,7 +251,7 @@ export async function getBatchProofStatuses(
   if (!native || !Array.isArray(native)) return null
 
   // returns array of status enum values mapped to numbers
-  return native.map((val: any) => Number(val))
+  return native.map((val: unknown) => Number(val))
 }
 
 function normalizeRegisterProofInput(input: RegisterProofInput): NormalizedRegisterProofInput {
@@ -300,10 +303,7 @@ export async function getProof(
   proofId: string,
   sourceAddress?: string,
 ): Promise<ChainProofRecord | null> {
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
-  }
+  const source = requireReadSource(sourceAddress)
 
   const server = new rpc.Server(RPC_URL)
   const account = await server.getAccount(source)
@@ -356,10 +356,7 @@ export async function getIssuerRecord(
   issuer: string,
   sourceAddress?: string,
 ): Promise<IssuerRecord | null> {
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
-  }
+  const source = requireReadSource(sourceAddress)
 
   const server = new rpc.Server(RPC_URL)
   const account = await server.getAccount(source)
@@ -384,45 +381,371 @@ export async function getIssuerRecord(
   if (!native) return null
 
   return {
-    metadataHash: bytesToHex(native.metadata_hash),
+    address: native.address ?? issuer,
+    tier: Number(native.tier),
     active: Boolean(native.active),
+    registeredAt: toUnixSeconds(native.registered_at),
   }
 }
 
-export async function getProofHistory(
+/**
+ * Read a dispute record from the registry by dispute ID.
+ *
+ * Simulation-only read following the pattern of `getProofHistoryCount`; no
+ * signing is required. Resolves to `null` when the contract returns an
+ * empty `Option` (no such dispute).
+ */
+export async function getDispute(
+  contractId: string,
+  disputeId: string,
+  sourceAddress?: string,
+): Promise<ChainDisputeRecord | null> {
+  const source = requireReadSource(sourceAddress)
+
+  const server = new rpc.Server(RPC_URL)
+  const account = await server.getAccount(source)
+  const contract = new Contract(contractId)
+  const transaction = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call('get_dispute' satisfies RegistryMethod, scBytes32(asHex32(disputeId, 'disputeId'))))
+    .setTimeout(30)
+    .build()
+
+  const simulation = await server.simulateTransaction(transaction)
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new Error(simulation.error)
+  }
+  if (!rpc.Api.isSimulationSuccess(simulation) && !rpc.Api.isSimulationRestore(simulation)) {
+    return null
+  }
+
+  const native = simulation.result?.retval ? scValToNative(simulation.result.retval) : null
+  if (native === null || native === undefined) return null
+
+  return {
+    disputeId: native.dispute_id?.toString?.() ?? String(native.dispute_id),
+    proofId: native.proof_id?.toString?.() ?? String(native.proof_id),
+    opener: native.opener ?? null,
+    reason: native.reason ?? '',
+    status: Number(native.status),
+    createdAt: native.created_at?.toString?.() ?? String(native.created_at),
+    resolvedAt: toUnixSeconds(native.resolved_at),
+  }
+}
+
+/**
+ * Read the number of open disputes for a proof ID.
+ *
+ * Simulation-only read following the pattern of `getProofHistoryCount`; no
+ * signing is required. Resolves to `null` when the contract returns an
+ * empty `Option`.
+ */
+export async function getOpenDisputeCount(
   contractId: string,
   proofId: string,
   sourceAddress?: string,
-  limit = 256,
-): Promise<ProofHistoryResult> {
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
+): Promise<number | null> {
+  const source = requireReadSource(sourceAddress)
+
+  const server = new rpc.Server(RPC_URL)
+  const account = await server.getAccount(source)
+  const contract = new Contract(contractId)
+  const transaction = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call('get_open_dispute_count' satisfies RegistryMethod, scBytes32(asHex32(proofId, 'proofId'))))
+    .setTimeout(30)
+    .build()
+
+  const simulation = await server.simulateTransaction(transaction)
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new Error(simulation.error)
+  }
+  if (!rpc.Api.isSimulationSuccess(simulation) && !rpc.Api.isSimulationRestore(simulation)) {
+    return null
   }
 
-  const count = await getProofHistoryCount(contractId, proofId, sourceAddress)
-  const cappedLimit = Math.min(limit, count)
-  const entries: ProofHistoryEntry[] = []
+  const native = simulation.result?.retval ? scValToNative(simulation.result.retval) : null
+  if (native === null || native === undefined) return null
 
-  for (let seq = 1; seq <= cappedLimit; seq += 1) {
-    const entry = await getProofHistoryAt(contractId, proofId, sourceAddress, seq)
-    if (entry) {
-      entries.push(entry)
+  return Number(native)
+}
+
+// ---------------------------------------------------------------------------
+// Dispute Workflow (#contracts/DISPUTE.md)
+// ---------------------------------------------------------------------------
+
+export enum DisputeReason {
+  ContentError = 1,
+  MetadataError = 2,
+  TierMismatch = 3,
+  CredentialLapsed = 4,
+  PrivacyViolation = 5,
+  Other = 6,
+}
+
+export const DISPUTE_REASON_LABELS: Record<DisputeReason, string> = {
+  [DisputeReason.ContentError]: 'Content error (tampered or invalid video/content)',
+  [DisputeReason.MetadataError]: 'Metadata error (incorrect claims/attributes)',
+  [DisputeReason.TierMismatch]: 'Tier mismatch (wrong identity tier)',
+  [DisputeReason.CredentialLapsed]: 'Credential lapsed (expired or stale root)',
+  [DisputeReason.PrivacyViolation]: 'Privacy violation (unauthorized disclosure)',
+  [DisputeReason.Other]: 'Other',
+}
+
+export enum DisputeStatus {
+  Open = 1,
+  Responded = 2,
+  Resolved = 3,
+  Dismissed = 4,
+  Superseded = 5,
+}
+
+export const DISPUTE_STATUS_LABELS: Record<DisputeStatus, string> = {
+  [DisputeStatus.Open]: 'Open',
+  [DisputeStatus.Responded]: 'Responded',
+  [DisputeStatus.Resolved]: 'Resolved',
+  [DisputeStatus.Dismissed]: 'Dismissed',
+  [DisputeStatus.Superseded]: 'Superseded',
+}
+
+export type ChainDisputeRecord = {
+  disputeId: string
+  proofId: string
+  reason: DisputeReason
+  reporterHash: string
+  commitmentHash: string
+  status: DisputeStatus
+  openedAt: number
+  respondDeadline: number
+  resolveDeadline: number
+  responseCommitment: string | null
+  resolvedAt: number
+  supersededBy: string | null
+}
+
+export type OpenDisputeInput = {
+  contractId: string
+  publicKey: string
+  proofId: string
+  reason: DisputeReason | number
+  evidenceHash: string
+  disputeId?: string
+  reporterHash?: string
+}
+
+export type RespondDisputeInput = {
+  contractId: string
+  publicKey: string
+  disputeId: string
+  responseCommitment: string
+}
+
+export function isValidDisputeReason(reason: number): reason is DisputeReason {
+  return Number.isInteger(reason) && reason >= 1 && reason <= 6
+}
+
+export function isValidEvidenceHash(hash: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(hash.trim())
+}
+
+export function validateDisputeReason(reason: number): DisputeReason {
+  if (!isValidDisputeReason(reason)) {
+    throw new Error('Dispute reason must be an integer between 1 and 6.')
+  }
+  return reason
+}
+
+export function validateEvidenceHash(hash: string, label = 'evidenceHash'): Hex32 {
+  const trimmed = hash.trim()
+  if (!isValidEvidenceHash(trimmed)) {
+    throw new Error(`${label} must be a 64-character (32-byte) hex string.`)
+  }
+  return asHex32(trimmed, label)
+}
+
+function generateRandomHex32(): string {
+  const bytes = new Uint8Array(32)
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes)
+  } else {
+    for (let i = 0; i < 32; i++) bytes[i] = Math.floor(Math.random() * 256)
+  }
+  return bytesToHex(bytes)
+}
+
+/**
+ * Open a dispute challenging a registered proof on the Stellar registry.
+ * Validates reason codes and evidence hash format client-side.
+ * Uses the TransactionStateMachine to track progress if provided.
+ */
+export async function openDispute(
+  input: OpenDisputeInput,
+  machine?: TransactionStateMachine,
+): Promise<RegisterProofResult> {
+  const reason = validateDisputeReason(Number(input.reason))
+  const evidenceHash = validateEvidenceHash(input.evidenceHash, 'evidenceHash')
+  const proofId = asHex32(input.proofId, 'proofId')
+  const disputeId = asHex32(input.disputeId ?? generateRandomHex32(), 'disputeId')
+
+  const reporterHash = asHex32(
+    input.reporterHash ?? (await sha256(`${input.publicKey}:${proofId}`)),
+    'reporterHash',
+  )
+
+  machine?.send({ type: 'SUBMIT' })
+
+  try {
+    const server = new rpc.Server(RPC_URL)
+    const account = await server.getAccount(input.publicKey)
+    const contract = new Contract(input.contractId)
+    const operation = contract.call(
+      'open_dispute' satisfies RegistryMethod,
+      new Address(input.publicKey).toScVal(),
+      scBytes32(reporterHash),
+      scBytes32(disputeId),
+      scBytes32(proofId),
+      scU32(reason),
+      scBytes32(evidenceHash),
+    )
+
+    const transaction = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(operation)
+      .setTimeout(90)
+      .build()
+
+    const prepared = await server.prepareTransaction(transaction)
+    const signed = await signTransaction(prepared.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: input.publicKey,
+    })
+
+    if (signed.error) {
+      const err = new Error(signed.error.message || 'Transaction rejected by wallet.')
+      machine?.send({ type: 'FAILED', error: err.message })
+      throw err
     }
-  }
 
-  return { entries, count }
+    const signedTransaction = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE)
+    const submitted: SendTransactionResponse = await server.sendTransaction(signedTransaction)
+
+    if ('errorResultXdr' in submitted && submitted.errorResultXdr) {
+      const err = new Error(`Stellar RPC rejected the transaction: ${submitted.errorResultXdr}`)
+      machine?.send({ type: 'FAILED', error: err.message })
+      throw err
+    }
+
+    const hash = submitted.hash ?? ''
+    machine?.send({ type: 'TX_HASH_RECEIVED', hash })
+
+    const txState = initialTxState(submitted.status)
+    if (submitted.status === 'SUCCESS') {
+      machine?.send({ type: 'CONFIRMED' })
+    }
+
+    return {
+      hash,
+      status: submitted.status,
+      txState,
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    machine?.send({ type: 'FAILED', error: msg })
+    throw error
+  }
 }
 
-export async function getProofHistoryAt(
+/**
+ * Respond to an open dispute as the issuer (Tier 3) or source (Tier 2).
+ * Validates response commitment format client-side.
+ * Uses the TransactionStateMachine to track progress if provided.
+ */
+export async function respondDispute(
+  input: RespondDisputeInput,
+  machine?: TransactionStateMachine,
+): Promise<RegisterProofResult> {
+  const disputeId = asHex32(input.disputeId, 'disputeId')
+  const responseCommitment = validateEvidenceHash(input.responseCommitment, 'responseCommitment')
+
+  machine?.send({ type: 'SUBMIT' })
+
+  try {
+    const server = new rpc.Server(RPC_URL)
+    const account = await server.getAccount(input.publicKey)
+    const contract = new Contract(input.contractId)
+    const operation = contract.call(
+      'respond_dispute' satisfies RegistryMethod,
+      new Address(input.publicKey).toScVal(),
+      scBytes32(disputeId),
+      scBytes32(responseCommitment),
+    )
+
+    const transaction = new TransactionBuilder(account, {
+      fee: BASE_FEE,
+      networkPassphrase: NETWORK_PASSPHRASE,
+    })
+      .addOperation(operation)
+      .setTimeout(90)
+      .build()
+
+    const prepared = await server.prepareTransaction(transaction)
+    const signed = await signTransaction(prepared.toXDR(), {
+      networkPassphrase: NETWORK_PASSPHRASE,
+      address: input.publicKey,
+    })
+
+    if (signed.error) {
+      const err = new Error(signed.error.message || 'Transaction rejected by wallet.')
+      machine?.send({ type: 'FAILED', error: err.message })
+      throw err
+    }
+
+    const signedTransaction = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE)
+    const submitted: SendTransactionResponse = await server.sendTransaction(signedTransaction)
+
+    if ('errorResultXdr' in submitted && submitted.errorResultXdr) {
+      const err = new Error(`Stellar RPC rejected the transaction: ${submitted.errorResultXdr}`)
+      machine?.send({ type: 'FAILED', error: err.message })
+      throw err
+    }
+
+    const hash = submitted.hash ?? ''
+    machine?.send({ type: 'TX_HASH_RECEIVED', hash })
+
+    const txState = initialTxState(submitted.status)
+    if (submitted.status === 'SUCCESS') {
+      machine?.send({ type: 'CONFIRMED' })
+    }
+
+    return {
+      hash,
+      status: submitted.status,
+      txState,
+    }
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    machine?.send({ type: 'FAILED', error: msg })
+    throw error
+  }
+}
+
+/**
+ * Return the number of currently Open disputes for a given proof.
+ */
+export async function getOpenDisputeCount(
   contractId: string,
   proofId: string,
   sourceAddress?: string,
-  seq = 1,
-): Promise<ProofHistoryEntry | null> {
+): Promise<number> {
   const source = sourceAddress || READONLY_SOURCE
   if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
+    return 0
   }
 
   const server = new rpc.Server(RPC_URL)
@@ -434,9 +757,49 @@ export async function getProofHistoryAt(
   })
     .addOperation(
       contract.call(
-        'get_proof_history_at' satisfies RegistryMethod,
+        'get_open_dispute_count' satisfies RegistryMethod,
         scBytes32(asHex32(proofId, 'proofId')),
-        scU32(seq),
+      ),
+    )
+    .setTimeout(30)
+    .build()
+
+  const simulation = await server.simulateTransaction(transaction)
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw new Error(simulation.error)
+  }
+  if (!rpc.Api.isSimulationSuccess(simulation) && !rpc.Api.isSimulationRestore(simulation)) {
+    return 0
+  }
+
+  const native = simulation.result?.retval ? scValToNative(simulation.result.retval) : 0
+  return Number(native)
+}
+
+/**
+ * Read a dispute record by dispute ID.
+ */
+export async function getDispute(
+  contractId: string,
+  disputeId: string,
+  sourceAddress?: string,
+): Promise<ChainDisputeRecord | null> {
+  const source = sourceAddress || READONLY_SOURCE
+  if (!source) {
+    return null
+  }
+
+  const server = new rpc.Server(RPC_URL)
+  const account = await server.getAccount(source)
+  const contract = new Contract(contractId)
+  const transaction = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      contract.call(
+        'get_dispute' satisfies RegistryMethod,
+        scBytes32(asHex32(disputeId, 'disputeId')),
       ),
     )
     .setTimeout(30)
@@ -454,188 +817,18 @@ export async function getProofHistoryAt(
   if (!native) return null
 
   return {
-    action: Number(native.action) as ProofHistoryEntry['action'],
-    timestamp: native.timestamp?.toString?.() ?? String(native.timestamp),
-    actor: native.actor == null ? null : String(native.actor),
-    reasonCode: Number(native.reason_code),
+    disputeId: bytesToHex(native.dispute_id),
+    proofId: bytesToHex(native.proof_id),
+    reason: Number(native.reason) as DisputeReason,
+    reporterHash: bytesToHex(native.reporter_hash),
+    commitmentHash: bytesToHex(native.commitment_hash),
+    status: Number(native.status) as DisputeStatus,
+    openedAt: Number(native.opened_at),
+    respondDeadline: Number(native.respond_deadline),
+    resolveDeadline: Number(native.resolve_deadline),
+    responseCommitment: native.response_commitment ? bytesToHex(native.response_commitment) : null,
+    resolvedAt: Number(native.resolved_at),
+    supersededBy: native.superseded_by ? bytesToHex(native.superseded_by) : null,
   }
 }
 
-export async function getProofHistoryCount(
-  contractId: string,
-  proofId: string,
-  sourceAddress?: string,
-): Promise<number> {
-  const source = sourceAddress || READONLY_SOURCE
-  if (!source) {
-    throw new Error('Set VITE_STELLAR_READONLY_SOURCE or connect a wallet for on-chain verification.')
-  }
-
-  const server = new rpc.Server(RPC_URL)
-  const account = await server.getAccount(source)
-  const contract = new Contract(contractId)
-  const transaction = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(contract.call('get_proof_history_count' satisfies RegistryMethod, scBytes32(asHex32(proofId, 'proofId'))))
-    .setTimeout(30)
-    .build()
-
-  const simulation = await server.simulateTransaction(transaction)
-  if (rpc.Api.isSimulationError(simulation)) {
-    throw new Error(simulation.error)
-  }
-  if (!rpc.Api.isSimulationSuccess(simulation) && !rpc.Api.isSimulationRestore(simulation)) {
-    return 0
-  }
-
-  const native = simulation.result?.retval ? scValToNative(simulation.result.retval) : 0
-  return Number(native)
-}
-
-export async function verifyProof(
-  contractId: string,
-  publicKey: string,
-  proofId: string,
-  reasonCode: number,
-): Promise<RegisterProofResult> {
-  const server = new rpc.Server(RPC_URL)
-  const account = await server.getAccount(publicKey)
-  const contract = new Contract(contractId)
-  const operation = contract.call(
-    'verify_proof' satisfies RegistryMethod,
-    new Address(publicKey).toScVal(),
-    scBytes32(asHex32(proofId, 'proofId')),
-    scU32(reasonCode),
-  )
-
-  const transaction = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(operation)
-    .setTimeout(90)
-    .build()
-
-  const prepared = await server.prepareTransaction(transaction)
-  const signed = await signTransaction(prepared.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: publicKey,
-  })
-
-  if (signed.error) {
-    throw new Error(signed.error.message)
-  }
-
-  const signedTransaction = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE)
-  const submitted = await server.sendTransaction(signedTransaction)
-
-  if ('errorResultXdr' in submitted && submitted.errorResultXdr) {
-    throw new Error(`Stellar RPC rejected the transaction: ${submitted.errorResultXdr}`)
-  }
-
-  return {
-    hash: submitted.hash,
-    status: submitted.status,
-    txState: initialTxState(submitted.status),
-  }
-}
-
-export async function expireProof(
-  contractId: string,
-  publicKey: string,
-  proofId: string,
-  reasonCode: number,
-): Promise<RegisterProofResult> {
-  const server = new rpc.Server(RPC_URL)
-  const account = await server.getAccount(publicKey)
-  const contract = new Contract(contractId)
-  const operation = contract.call(
-    'expire_proof' satisfies RegistryMethod,
-    new Address(publicKey).toScVal(),
-    scBytes32(asHex32(proofId, 'proofId')),
-    scU32(reasonCode),
-  )
-
-  const transaction = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(operation)
-    .setTimeout(90)
-    .build()
-
-  const prepared = await server.prepareTransaction(transaction)
-  const signed = await signTransaction(prepared.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: publicKey,
-  })
-
-  if (signed.error) {
-    throw new Error(signed.error.message)
-  }
-
-  const signedTransaction = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE)
-  const submitted = await server.sendTransaction(signedTransaction)
-
-  if ('errorResultXdr' in submitted && submitted.errorResultXdr) {
-    throw new Error(`Stellar RPC rejected the transaction: ${submitted.errorResultXdr}`)
-  }
-
-  return {
-    hash: submitted.hash,
-    status: submitted.status,
-    txState: initialTxState(submitted.status),
-  }
-}
-
-export async function correctProof(
-  contractId: string,
-  publicKey: string,
-  proofId: string,
-  newMetadataHash: string,
-  reasonCode: number,
-): Promise<RegisterProofResult> {
-  const server = new rpc.Server(RPC_URL)
-  const account = await server.getAccount(publicKey)
-  const contract = new Contract(contractId)
-  const operation = contract.call(
-    'correct_proof' satisfies RegistryMethod,
-    new Address(publicKey).toScVal(),
-    scBytes32(asHex32(proofId, 'proofId')),
-    scBytes32(asHex32(newMetadataHash, 'newMetadataHash')),
-    scU32(reasonCode),
-  )
-
-  const transaction = new TransactionBuilder(account, {
-    fee: BASE_FEE,
-    networkPassphrase: NETWORK_PASSPHRASE,
-  })
-    .addOperation(operation)
-    .setTimeout(90)
-    .build()
-
-  const prepared = await server.prepareTransaction(transaction)
-  const signed = await signTransaction(prepared.toXDR(), {
-    networkPassphrase: NETWORK_PASSPHRASE,
-    address: publicKey,
-  })
-
-  if (signed.error) {
-    throw new Error(signed.error.message)
-  }
-
-  const signedTransaction = TransactionBuilder.fromXDR(signed.signedTxXdr, NETWORK_PASSPHRASE)
-  const submitted = await server.sendTransaction(signedTransaction)
-
-  if ('errorResultXdr' in submitted && submitted.errorResultXdr) {
-    throw new Error(`Stellar RPC rejected the transaction: ${submitted.errorResultXdr}`)
-  }
-
-  return {
-    hash: submitted.hash,
-    status: submitted.status,
-    txState: initialTxState(submitted.status),
-  }
-}

@@ -2,19 +2,26 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 try:
-    from analytics.log_processor import LogEntry, LogProcessor
+    from analytics.log_processor import LogEntry, LogProcessor, validate_log_export_safety
 except Exception:
-    LogEntry = None
-    LogProcessor = None
+    try:
+        from backend.analytics.log_processor import LogEntry, LogProcessor, validate_log_export_safety
+    except Exception:
+        LogEntry = None
+        LogProcessor = None
+        validate_log_export_safety = None
 
 
 EXPORT_FORMAT_VERSION = "1.0.0"
+
+_SAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 @dataclass
@@ -49,6 +56,18 @@ class ExportArtifact:
     rollout_phase: str = "shadow"
     redaction_version: str = "harpocrates-redaction-v1"
     encryption_at_rest: bool = False
+    # Server-selected, filesystem-safe name. Never derived from user input.
+    server_file_name: str = ""
+    # Caller-requested display label. Only populated for authorized output.
+    display_label: Optional[str] = None
+
+
+def sanitize_display_label(label: Optional[str]) -> Optional[str]:
+    """Return a bounded, printable display label. Never used for filesystem paths."""
+    if label is None:
+        return None
+    cleaned = "".join(ch for ch in str(label) if ch.isprintable())
+    return cleaned[:128]
 
 
 class ExportManager:
@@ -77,6 +96,12 @@ class ExportManager:
         digest = hashlib.sha256(raw).hexdigest()[:16]
         return self._policy.export_id_prefix + digest
 
+    def generate_server_file_name(self, artifact_id: str, compress: bool) -> str:
+        """Build a filesystem name solely from server-generated identifiers."""
+        token = _SAFE_LABEL_RE.sub("", artifact_id.replace(":", "-"))
+        suffix = ".json.gz" if compress else ".json"
+        return token + suffix
+
     def compute_safety_signature(self, entries: List[LogEntry]) -> str:
         sorted_entries = sorted(entries, key=lambda x: x.entry_id)
         parts = []
@@ -94,6 +119,7 @@ class ExportManager:
         compress: Optional[bool] = None,
         rollout_phase: str = "shadow",
         export_token_verified: bool = False,
+        display_label: Optional[str] = None,
     ) -> Tuple[Optional[ExportArtifact], str, int]:
         with self._lock:
             policy = self._policy
@@ -107,6 +133,8 @@ class ExportManager:
                 entries_filtered = []
             if not policy.include_sampled_out_events:
                 entries_filtered = [e for e in entries_filtered if e.export_safe]
+            if validate_log_export_safety is not None:
+                entries_filtered = [e for e in entries_filtered if validate_log_export_safety(e)[0]]
             if policy.require_safety_signature:
                 all_safe = all(e.export_safe for e in entries_filtered)
                 if not all_safe:
@@ -143,6 +171,8 @@ class ExportManager:
                 checksum_sha256_prefix16=checksum,
                 rollout_phase=rollout_phase,
                 encryption_at_rest=False,
+                server_file_name=self.generate_server_file_name(artifact_id, use_compress),
+                display_label=sanitize_display_label(display_label) if export_token_verified else None,
             )
             if len(self._artifacts) >= self._max_artifacts_memory:
                 if self._artifact_queue:

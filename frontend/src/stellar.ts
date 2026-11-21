@@ -17,8 +17,10 @@ export {
   getProofHistory,
   getProofHistoryAt,
   getProofHistoryCount,
+  getOpenDisputeCount,
   registerProofOnStellar,
   verifyProof,
+  getVerifierState,
   CONTRACT_NETWORK_PASSPHRASE,
 } from './harpocratesRegistry'
 // Re-export for use by wallet hook and guard code.

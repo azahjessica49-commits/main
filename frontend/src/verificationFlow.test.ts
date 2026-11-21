@@ -86,8 +86,27 @@ describe('verification flow integration', () => {
     expect(result.events).toEqual([EVENT])
     expect(result.chainProof).toEqual(ACTIVE_CHAIN_PROOF)
     expect(extractMetadata).toHaveBeenCalledWith(FILE)
-    expect(fetch).toHaveBeenCalledWith(`${API_BASE}/api/proofs/by-video/${VIDEO_HASH}`)
+    expect(fetch).toHaveBeenCalledWith(`${API_BASE}/api/proofs/by-video/${VIDEO_HASH}`, { signal: undefined })
     expect(getProofByVideoHash).toHaveBeenCalledWith(CONTRACT_ID, VIDEO_HASH, undefined)
+  })
+
+  it('forwards abort signal to fetchProofEventsByVideo', async () => {
+    const fetch = mockApi([EVENT])
+    extractMetadata.mockResolvedValue({ protocol: 'harpocrates' })
+    getProofByVideoHash.mockResolvedValue(ACTIVE_CHAIN_PROOF)
+    const controller = new AbortController()
+
+    await verifyArtifact({
+      apiBase: API_BASE,
+      contractId: CONTRACT_ID,
+      file: FILE,
+      videoHash: VIDEO_HASH,
+      signal: controller.signal,
+    })
+
+    expect(fetch).toHaveBeenCalledWith(`${API_BASE}/api/proofs/by-video/${VIDEO_HASH}`, {
+      signal: controller.signal,
+    })
   })
 
   it('marks embedded metadata without corroborating records as unconfirmed', async () => {
@@ -127,7 +146,7 @@ describe('verification flow integration', () => {
     // We import the mock class to throw it
     const { MalformedEvidenceError } = await import('./stego')
     extractMetadata.mockRejectedValue(new MalformedEvidenceError())
-    const fetch = vi.spyOn(globalThis, 'fetch')
+    vi.spyOn(globalThis, 'fetch')
 
     const result = await runVerification()
 
@@ -139,7 +158,7 @@ describe('verification flow integration', () => {
 
   it('makes no trust decision when a verification service is unavailable', async () => {
     extractMetadata.mockResolvedValue({ protocol: 'harpocrates' })
-    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('offline'))
+    vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('offline'))
 
     const result = await runVerification()
 
