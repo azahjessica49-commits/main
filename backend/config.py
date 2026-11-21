@@ -52,6 +52,8 @@ class AppConfig:
     external_fetch_max_response_bytes: int
     # Owner-scoped credentials: each key may only register its own sourceAddress.
     register_scoped_keys: tuple[ScopedKey, ...] = ()
+    registration_reconcile_state_dir: str = ""
+    stellar_network_passphrase: str = ""
 
 
 def load_config() -> AppConfig:
@@ -117,6 +119,12 @@ def load_config() -> AppConfig:
         external_fetch_read_timeout_seconds=_float_env("EXTERNAL_FETCH_READ_TIMEOUT_SECONDS", 10.0),
         external_fetch_max_response_bytes=_int_env("EXTERNAL_FETCH_MAX_RESPONSE_BYTES", 65_536),
         register_scoped_keys=parse_scoped_keys(_str_env("REGISTER_SCOPED_KEYS")),
+        registration_reconcile_state_dir=_str_env("HARPOCRATES_REGISTRATION_RECONCILE_DIR") or "",
+        stellar_network_passphrase=(
+            _str_env("STELLAR_NETWORK_PASSPHRASE")
+            or _str_env("HARPOCRATES_NETWORK_PASSPHRASE")
+            or ""
+        ),
     )
 
 
