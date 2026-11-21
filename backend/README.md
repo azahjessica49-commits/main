@@ -120,6 +120,47 @@ that cursor. Replayed projections are idempotent on `(tx_hash, event_index)`,
 so rows committed before a failed page retry are treated as duplicates. No
 additional configuration or database migration is required.
 
+## Upload Admission Decision Schema
+
+Admission-controlled upload routes return a stable decision payload when they
+reject work. The legacy top-level `reason` (`identity_limit`, `queue_full`, or
+`timeout`) is retained for existing callers; new callers should use
+`error.admission`.
+
+| Stable code | Stable reason | HTTP | Meaning |
+| --- | --- | --- | --- |
+| `ADMISSION_IDENTITY_QUOTA` | `identity_quota` | 429 | The caller has reached its configured concurrent-upload quota. |
+| `ADMISSION_QUEUE_SATURATION` | `queue_saturation` | 503 | The bounded admission queue is full. |
+| `ADMISSION_PROCESSING_CAPACITY` | `processing_capacity` | 503 | A processing slot did not become available before the admission timeout. |
+
+Rejections use the standard error envelope plus an `admission` object:
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "ADMISSION_QUEUE_SATURATION",
+    "message": "upload admission queue is full",
+    "request_id": "a1b2c3d4-...",
+    "admission": {
+      "code": "ADMISSION_QUEUE_SATURATION",
+      "reason": "queue_saturation",
+      "message": "upload admission queue is full",
+      "retryAfterSeconds": 10,
+      "retryable": true
+    }
+  },
+  "reason": "queue_full",
+  "admissionReason": "queue_saturation",
+  "retryAfterSeconds": 10
+}
+```
+
+`retryAfterSeconds` is bounded to 1–60 seconds and always matches the
+`Retry-After` response header. Messages never include client identity, queue
+depth, concurrency counters, or other callers' state. No new environment
+variables are required.
+
 ## Upload Session Cancellation
 
 Upload sessions created by `POST /api/stego/upload-session` can be cancelled with

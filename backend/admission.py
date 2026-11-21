@@ -1,3 +1,4 @@
+import math
 import threading
 import time
 import uuid
@@ -7,6 +8,135 @@ from functools import wraps
 from typing import Dict, List, Optional, Tuple
 
 from flask import g, request, jsonify
+
+
+RETRY_AFTER_MIN_SECONDS = 1
+RETRY_AFTER_MAX_SECONDS = 60
+
+ADMISSION_IDENTITY_QUOTA = "ADMISSION_IDENTITY_QUOTA"
+ADMISSION_QUEUE_SATURATION = "ADMISSION_QUEUE_SATURATION"
+ADMISSION_PROCESSING_CAPACITY = "ADMISSION_PROCESSING_CAPACITY"
+
+ADMISSION_DECISION_SCHEMA = {
+    "title": "UploadAdmissionDecision",
+    "type": "object",
+    "required": [
+        "code",
+        "reason",
+        "message",
+        "retryAfterSeconds",
+        "retryable",
+    ],
+    "properties": {
+        "code": {
+            "type": "string",
+            "enum": [
+                ADMISSION_IDENTITY_QUOTA,
+                ADMISSION_QUEUE_SATURATION,
+                ADMISSION_PROCESSING_CAPACITY,
+            ],
+        },
+        "reason": {
+            "type": "string",
+            "enum": ["identity_quota", "queue_saturation", "processing_capacity"],
+        },
+        "message": {"type": "string"},
+        "retryAfterSeconds": {
+            "type": "integer",
+            "minimum": RETRY_AFTER_MIN_SECONDS,
+            "maximum": RETRY_AFTER_MAX_SECONDS,
+        },
+        "retryable": {"type": "boolean", "const": True},
+        "maxRetryAfterSeconds": RETRY_AFTER_MAX_SECONDS,
+    },
+}
+
+
+class AdmissionReason(str, Enum):
+    IDENTITY_QUOTA = "identity_quota"
+    QUEUE_SATURATION = "queue_saturation"
+    PROCESSING_CAPACITY = "processing_capacity"
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    legacy_reason: str
+    reason: AdmissionReason
+    code: str
+    message: str
+    status: int
+    retry_after_seconds: int
+
+    def as_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "reason": self.reason.value,
+            "message": self.message,
+            "retryAfterSeconds": self.retry_after_seconds,
+            "retryable": True,
+        }
+
+
+_ADMISSION_DECISIONS = {
+    "identity_limit": (
+        AdmissionReason.IDENTITY_QUOTA,
+        ADMISSION_IDENTITY_QUOTA,
+        "upload concurrency quota reached for this client",
+        429,
+    ),
+    "queue_full": (
+        AdmissionReason.QUEUE_SATURATION,
+        ADMISSION_QUEUE_SATURATION,
+        "upload admission queue is full",
+        503,
+    ),
+    "timeout": (
+        AdmissionReason.PROCESSING_CAPACITY,
+        ADMISSION_PROCESSING_CAPACITY,
+        "upload processing capacity is temporarily unavailable",
+        503,
+    ),
+    "cancelled": (
+        AdmissionReason.PROCESSING_CAPACITY,
+        ADMISSION_PROCESSING_CAPACITY,
+        "upload processing capacity is temporarily unavailable",
+        503,
+    ),
+}
+
+
+def admission_decision(reason: str, timeout_seconds: float) -> AdmissionDecision:
+    decision_reason, code, message, status = _ADMISSION_DECISIONS.get(
+        reason,
+        _ADMISSION_DECISIONS["timeout"],
+    )
+    retry_after = math.ceil(max(0.0, float(timeout_seconds)))
+    retry_after = max(RETRY_AFTER_MIN_SECONDS, min(RETRY_AFTER_MAX_SECONDS, retry_after))
+    return AdmissionDecision(
+        legacy_reason=reason,
+        reason=decision_reason,
+        code=code,
+        message=message,
+        status=status,
+        retry_after_seconds=retry_after,
+    )
+
+
+def admission_error_response(decision: AdmissionDecision):
+    payload = decision.as_dict()
+    request_id = getattr(g, "request_id", "unknown")
+    return jsonify({
+        "ok": False,
+        "error": {
+            "code": decision.code,
+            "message": decision.message,
+            "request_id": request_id,
+            "admission": payload,
+        },
+        "reason": decision.legacy_reason,
+        "admissionReason": decision.reason.value,
+        "retryAfterSeconds": decision.retry_after_seconds,
+    })
 
 
 class AdmissionState(str, Enum):
@@ -235,13 +365,10 @@ def require_capacity(controller: AdmissionController):
                 endpoint = request.url_rule.rule if request.url_rule else request.path
                 metrics_collector.record_rejection(reason, endpoint)
 
-                status_code = 429 if reason == "identity_limit" else 503
-                response = jsonify({
-                    "error": "service overloaded",
-                    "reason": reason,
-                })
-                response.status_code = status_code
-                response.headers["Retry-After"] = str(int(controller.timeout_seconds * 2) or 5)
+                decision = admission_decision(reason, controller.timeout_seconds)
+                response = admission_error_response(decision)
+                response.status_code = decision.status
+                response.headers["Retry-After"] = str(decision.retry_after_seconds)
                 return response
 
             try:
