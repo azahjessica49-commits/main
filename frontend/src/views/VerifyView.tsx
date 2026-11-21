@@ -1,17 +1,38 @@
-import { useMemo, useRef } from 'react'
-import { CheckCircle2, Loader2, RefreshCw, Upload, WifiOff, XCircle } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { CheckCircle2, FileText, Loader2, RefreshCw, Upload, WifiOff, XCircle } from 'lucide-react'
 import type { UseVerificationReturn } from '../hooks/useVerification'
 import { ChainProofPanel } from '../components/ChainProofPanel'
+import { DisputePanel } from '../components/DisputePanel'
 import { EventList } from '../components/EventList'
 import { ShareVerificationLink } from '../components/ShareVerificationLink'
+import { VerifierSetStatusPanel } from '../components/VerifierSetStatusPanel'
 import VerificationTimeline from '../components/VerificationTimeline'
 import { shortHash } from '../utils'
 import ProvenanceCard from '../provenance/ProvenanceCard'
 import type { ProvenanceRecord } from '../provenance/provenanceModel'
 import { CONTRACT_NETWORK_PASSPHRASE } from '../stellar'
 import type { VerificationShareLinkInput } from '../verificationShareLink'
+import { tryParseManifest } from '../batchVerifier'
+import {
+  buildVerificationDimensions,
+  type TrustDimensionState,
+} from '../services/verificationFlow'
 
 const CONTRACT_ID = import.meta.env.VITE_HARPOCRATES_REGISTRY_ID ?? ''
+const MAX_MANIFEST_SIZE_BYTES = 64 * 1024 // 64 KB cap
+
+function dimensionStateLabel(state: TrustDimensionState): string {
+  switch (state) {
+    case 'verified':
+      return 'Verified'
+    case 'failed':
+      return 'Failed'
+    case 'unverified':
+      return 'Unverified'
+    case 'not_applicable':
+      return 'Not applicable'
+  }
+}
 
 type Props = {
   wallet: string
@@ -45,31 +66,99 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
     setOffline,
     verifyEvidence,
     loadEvents,
+    loadSharedVerification,
     cancel,
     retry,
     clear,
   } = verification
 
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const manifestInputRef = useRef<HTMLInputElement | null>(null)
+  const [videoHashInput, setVideoHashInput] = useState('')
+  const [proofIdInput, setProofIdInput] = useState('')
+  const [manifestError, setManifestError] = useState<string | null>(null)
+
+  // Keep videoHashInput synced when verifyHash updates externally
+  useEffect(() => {
+    if (verifyHash && !videoHashInput) {
+      setVideoHashInput(verifyHash)
+    }
+  }, [verifyHash, videoHashInput])
+
+  const handleManifestFile = async (file: File) => {
+    if (file.size > MAX_MANIFEST_SIZE_BYTES) {
+      setManifestError(`Manifest file exceeds the 64 KB size limit (${(file.size / 1024).toFixed(1)} KB).`)
+      return
+    }
+
+    const manifest = await tryParseManifest(file)
+    if (!manifest) {
+      setManifestError('Invalid or malformed proof manifest JSON.')
+      return
+    }
+
+    setManifestError(null)
+    setVideoHashInput(manifest.videoHash)
+    setProofIdInput(manifest.proofId ?? '')
+
+    // Start chain verification
+    if (typeof loadSharedVerification === 'function') {
+      void loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: manifest.videoHash,
+        proofId: manifest.proofId,
+        metadataHash: manifest.metadataHash,
+        network: manifest.network || CONTRACT_NETWORK_PASSPHRASE,
+        contractId: manifest.contractId || CONTRACT_ID,
+        transactionRef: manifest.transactionRef || undefined,
+        tier: manifest.tier,
+      })
+    }
+  }
+
+  const handleManualSubmit = async () => {
+    const vHash = videoHashInput.trim()
+    const pId = proofIdInput.trim()
+    if (!vHash) return
+    setManifestError(null)
+    if (typeof loadSharedVerification === 'function') {
+      void loadSharedVerification({
+        protocol: 'harpocrates-verification-link',
+        version: 1,
+        videoHash: vHash,
+        proofId: pId,
+        metadataHash: '',
+        network: CONTRACT_NETWORK_PASSPHRASE,
+        contractId: CONTRACT_ID,
+      })
+    }
+  }
+
+  const revocationProofId =
+    events.find((event) => event.video_hash === (videoHashInput || verifyHash) && event.proof_id)?.proof_id ??
+    proofIdInput ??
+    null
 
   const isError = status === 'error'
   const isCancelled = status === 'cancelled'
-  const showRetry = isError && !!errorCode && errorCode !== 'CANCELLED' && errorCode !== 'REVOKED_EVIDENCE' && errorCode !== 'EXPIRED_EVIDENCE'
+  const showRetry = isError && !manifestError && !!errorCode && errorCode !== 'CANCELLED' && errorCode !== 'REVOKED_EVIDENCE' && errorCode !== 'EXPIRED_EVIDENCE'
   // Revoked/expired are terminal trust decisions, retry still allowed but we keep it available via retry button
   const effectiveRetry = isError || isCancelled
 
   const shareLinkInput = useMemo((): VerificationShareLinkInput | null => {
-    if (status !== 'success' || !verifyHash || !CONTRACT_ID) return null
-    const matchedEvent = events.find((event) => event.proof_id && event.video_hash === verifyHash)
+    const activeHash = videoHashInput || verifyHash
+    if (status !== 'success' || !activeHash || !CONTRACT_ID) return null
+    const matchedEvent = events.find((event) => event.proof_id && event.video_hash === activeHash)
       ?? events.find((event) => !!event.proof_id)
-    const proofId = matchedEvent?.proof_id ?? null
+    const proofId = matchedEvent?.proof_id ?? proofIdInput ?? null
     const metadataHash = chainProof?.metadataHash ?? provenanceRecord?.metadata.metadataHash ?? null
     if (!proofId || !metadataHash) return null
     const tierRaw = matchedEvent?.tier
     const tier =
       tierRaw === 'silent' || tierRaw === 'source' || tierRaw === 'seal' ? tierRaw : undefined
     return {
-      videoHash: verifyHash,
+      videoHash: activeHash,
       proofId,
       metadataHash,
       network: provenanceRecord?.network.passphrase || CONTRACT_NETWORK_PASSPHRASE,
@@ -77,7 +166,26 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
       transactionRef: provenanceRecord?.ledger.transactionHash || matchedEvent?.tx_hash || undefined,
       tier,
     }
-  }, [status, verifyHash, events, chainProof, provenanceRecord])
+  }, [status, videoHashInput, verifyHash, events, proofIdInput, chainProof, provenanceRecord])
+
+  const showTrustDimensions =
+    status !== 'idle' || !!chainProof || events.length > 0 || !!errorCode
+
+  const trustModel = useMemo(() => {
+    const hasHarpocratesMetadata =
+      errorCode === 'METADATA_ENVELOPE_MISMATCH'
+        ? false
+        : status === 'success' &&
+          /(Confirmed:|Metadata only:|Locally verified:)/i.test(verifyResult)
+    return buildVerificationDimensions({
+      hasHarpocratesMetadata,
+      metadataEnvelopeMismatch: errorCode === 'METADATA_ENVELOPE_MISMATCH',
+      onChain: chainProof,
+      events,
+      offline,
+      errorCode,
+    })
+  }, [status, verifyResult, chainProof, events, offline, errorCode])
 
   return (
     <section className="workspace app-page verify-page" id="verify">
@@ -94,25 +202,59 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
           </div>
         ) : null}
 
+        {manifestError ? (
+          <div className="network-mismatch-banner manifest-error-banner" role="alert" aria-live="assertive" aria-atomic="true">
+            <span className="network-mismatch-icon" aria-hidden="true">⚠</span>
+            <span>{manifestError}</span>
+          </div>
+        ) : null}
+
+        {/* Dropzone — keyboard: Tab focuses the label, Enter/Space opens the file picker */}
         <label
           className="dropzone"
+          role="button"
+          tabIndex={isVerifying ? -1 : 0}
+          aria-label={isVerifying ? statusLabel(status, offline) : 'Drop or choose a received video. Press Enter or Space to open file picker'}
           aria-busy={isVerifying}
+          aria-disabled={isVerifying}
           // ensure dropzone is a large touch target on mobile
           style={{ minHeight: 140 }}
+          onKeyDown={(e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && !isVerifying) {
+              e.preventDefault()
+              inputRef.current?.click()
+            }
+          }}
+          onDragOver={(e) => {
+            e.preventDefault()
+          }}
+          onDrop={(e) => {
+            e.preventDefault()
+            const f = e.dataTransfer.files?.[0] ?? null
+            if (f) {
+              if (f.name.endsWith('.json') || f.type === 'application/json') {
+                void handleManifestFile(f)
+              } else {
+                void verifyEvidence(f, wallet || undefined)
+              }
+            }
+          }}
         >
           {isVerifying ? (
             <Loader2 size={20} className="spin" aria-hidden="true" />
           ) : (
             <Upload size={20} aria-hidden="true" />
           )}
-          <span>{isVerifying ? statusLabel(status, offline) : 'Drop or choose a received video'}</span>
-          <span className="muted" style={{ fontSize: 11, textAlign: 'center', overflowWrap: 'anywhere' }}>
+          <span aria-hidden="true">{isVerifying ? statusLabel(status, offline) : 'Drop or choose a received video'}</span>
+          <span className="muted" aria-hidden="true" style={{ fontSize: 11, textAlign: 'center', overflowWrap: 'anywhere' }}>
             MP4, WebM, or MOV · up to 100 MB
           </span>
           <input
             ref={inputRef}
             type="file"
             accept="video/*"
+            tabIndex={-1}
+            aria-hidden="true"
             disabled={isVerifying}
             onChange={(event) => {
               const f = event.target.files?.[0] ?? null
@@ -122,6 +264,104 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
             }}
           />
         </label>
+
+        {/* Manifest Dropzone — keyboard: Tab focuses label, Enter/Space opens manifest file picker */}
+        <label
+          className="dropzone manifest-dropzone"
+          role="button"
+          tabIndex={isVerifying ? -1 : 0}
+          aria-label={isVerifying ? 'Manifest upload disabled during verification' : 'Proof manifest JSON upload. Press Enter or Space to open file picker'}
+          aria-busy={isVerifying}
+          aria-disabled={isVerifying}
+          style={{ minHeight: 100 }}
+          onKeyDown={(e) => {
+            if ((e.key === 'Enter' || e.key === ' ') && !isVerifying) {
+              e.preventDefault()
+              manifestInputRef.current?.click()
+            }
+          }}
+          onDragOver={(e) => {
+            e.preventDefault()
+          }}
+          onDrop={(e) => {
+            e.preventDefault()
+            const f = e.dataTransfer.files?.[0] ?? null
+            if (f) void handleManifestFile(f)
+          }}
+        >
+          {isVerifying ? (
+            <Loader2 size={20} className="spin" aria-hidden="true" />
+          ) : (
+            <FileText size={20} aria-hidden="true" />
+          )}
+          <span aria-hidden="true">{isVerifying ? 'Verification in progress…' : 'Drop or choose a proof manifest JSON'}</span>
+          <span className="muted" aria-hidden="true" style={{ fontSize: 11, textAlign: 'center', overflowWrap: 'anywhere' }}>
+            Portable manifest receipt · max 64 KB
+          </span>
+          <input
+            ref={manifestInputRef}
+            type="file"
+            accept=".json,application/json"
+            tabIndex={-1}
+            aria-label="Drop or choose a proof manifest JSON"
+            disabled={isVerifying}
+            onChange={(event) => {
+              const f = event.target.files?.[0] ?? null
+              if (f) void handleManifestFile(f)
+              event.target.value = ''
+            }}
+          />
+        </label>
+
+        {/* Verification form — prefilled by manifest or manual typing */}
+        <form
+          className="manifest-verify-form"
+          aria-label="Manifest verification form"
+          onSubmit={(e) => {
+            e.preventDefault()
+            void handleManualSubmit()
+          }}
+        >
+          <div className="form-group">
+            <label htmlFor="verify-video-hash">Video Hash</label>
+            <input
+              id="verify-video-hash"
+              type="text"
+              name="videoHash"
+              value={videoHashInput}
+              onChange={(e) => {
+                setVideoHashInput(e.target.value)
+                setManifestError(null)
+              }}
+              placeholder="Prefilled by manifest or enter 64-char hex video hash"
+              disabled={isVerifying}
+              aria-label="Video Hash"
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="verify-proof-id">Proof ID</label>
+            <input
+              id="verify-proof-id"
+              type="text"
+              name="proofId"
+              value={proofIdInput}
+              onChange={(e) => {
+                setProofIdInput(e.target.value)
+                setManifestError(null)
+              }}
+              placeholder="Prefilled by manifest or enter proof ID"
+              disabled={isVerifying}
+              aria-label="Proof ID"
+            />
+          </div>
+          <button
+            type="submit"
+            className="hero-secondary"
+            disabled={isVerifying || !videoHashInput.trim()}
+          >
+            Verify On-Chain
+          </button>
+        </form>
 
         {/* Verification mode — offline runs entirely in the browser, online uses backend + registry */}
         <div className="verify-mode" role="group" aria-label="Verification mode">
@@ -159,27 +399,62 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
         </div>
 
         <div
-          className={`verify-result large ${isError ? 'verify-error' : ''} ${isCancelled ? 'verify-cancelled' : ''}`}
+          className={`verify-result large ${isError || manifestError ? 'verify-error' : ''} ${isCancelled ? 'verify-cancelled' : ''}`}
           role={isError ? 'alert' : 'status'}
           aria-live={isError ? 'assertive' : 'polite'}
           aria-atomic="true"
         >
-          {isError ? (
+          {isError || manifestError ? (
             <XCircle size={14} aria-hidden="true" />
           ) : (
             <CheckCircle2 size={14} aria-hidden="true" />
           )}
           <div style={{ minWidth: 0, flex: 1 }}>
             <p style={{ overflowWrap: 'anywhere', wordBreak: 'break-word' }}>
-              {verifyResult || statusLabel(status, offline)}
+              {manifestError || verifyResult || statusLabel(status, offline)}
             </p>
-            {errorCode ? (
+            {errorCode && !manifestError ? (
               <p className="muted" style={{ marginTop: 4, fontSize: 11 }}>
                 Code: {errorCode}
               </p>
             ) : null}
           </div>
         </div>
+
+        {showTrustDimensions ? (
+          <section
+            className="trust-dimensions"
+            aria-label="Verification trust dimensions"
+            data-overall-verdict={trustModel.overall}
+          >
+            <h3 style={{ fontSize: '0.85rem', marginBottom: 6 }}>Trust Dimensions</h3>
+            {trustModel.hasFailure ? (
+              <p className="muted" style={{ fontSize: 11, marginBottom: 8 }}>
+                One or more trust dimensions failed; successful dimensions do not override failures.
+              </p>
+            ) : null}
+            <ul className="trust-dimensions-list" style={{ listStyle: 'none', padding: 0, margin: 0, display: 'grid', gap: 6 }}>
+              {Object.values(trustModel.dimensions).map((dim) => (
+                <li
+                  key={dim.key}
+                  data-dimension={dim.key}
+                  data-state={dim.state}
+                  style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: 8, fontSize: 12 }}
+                >
+                  <div>
+                    <strong>{dim.label}</strong>
+                    <span className="muted" style={{ display: 'block', fontSize: 11 }}>
+                      {dim.summary}
+                    </span>
+                  </div>
+                  <span className={`trust-dimension-state trust-dimension-${dim.state}`}>
+                    {dimensionStateLabel(dim.state)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
 
         <VerificationTimeline
           status={status}
@@ -212,11 +487,16 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               <span>Retry</span>
             </button>
           ) : null}
-          {!isVerifying && (verifyHash || verifyResult) ? (
+          {!isVerifying && (verifyHash || verifyResult || videoHashInput || proofIdInput || manifestError) ? (
             <button
               type="button"
               className="hero-secondary verify-action-btn"
-              onClick={clear}
+              onClick={() => {
+                setVideoHashInput('')
+                setProofIdInput('')
+                setManifestError(null)
+                clear()
+              }}
               aria-label="Clear verification result"
             >
               Clear
@@ -237,7 +517,11 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
         <dl className="data-list">
           <div>
             <dt>Received Hash</dt>
-            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(verifyHash)}</dd>
+            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(videoHashInput || verifyHash)}</dd>
+          </div>
+          <div>
+            <dt>Proof ID</dt>
+            <dd style={{ overflowWrap: 'anywhere', wordBreak: 'break-all', textAlign: 'right' }}>{shortHash(proofIdInput || revocationProofId || '')}</dd>
           </div>
           <div>
             <dt>Chain Status</dt>
@@ -258,7 +542,22 @@ export function VerifyView({ wallet, networkMismatch, verification, provenanceRe
               On-chain status was not checked in offline mode. No trust decision was made.
             </p>
           ) : (
-            <ChainProofPanel chainProof={chainProof} />
+            <>
+              <ChainProofPanel
+                chainProof={chainProof}
+                proofId={revocationProofId}
+                sourceAddress={wallet || undefined}
+              />
+              <DisputePanel
+                proofId={revocationProofId}
+                wallet={wallet}
+                networkMismatch={networkMismatch}
+                offline={offline}
+                chainProof={chainProof}
+              />
+              <h4 style={{ marginTop: '1rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>Verifier Set Status</h4>
+              <VerifierSetStatusPanel />
+            </>
           )}
           {provenanceRecord ? <ProvenanceCard provenance={provenanceRecord} /> : null}
         </div>

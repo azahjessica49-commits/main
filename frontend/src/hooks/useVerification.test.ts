@@ -12,6 +12,7 @@ vi.mock('../services/verificationService', () => ({
   extractMetadata: vi.fn(),
   fetchProofEventsByVideo: vi.fn(),
   getOnChainProof: vi.fn(),
+  getMetadataEnvelope: vi.fn(),
 }))
 
 vi.mock('../services/evidenceService', () => ({
@@ -31,6 +32,7 @@ async function getVerifMock() {
     extractMetadata: ReturnType<typeof vi.fn>
     fetchProofEventsByVideo: ReturnType<typeof vi.fn>
     getOnChainProof: ReturnType<typeof vi.fn>
+    getMetadataEnvelope: ReturnType<typeof vi.fn>
   }
 }
 
@@ -52,6 +54,7 @@ beforeEach(async () => {
   vm.extractMetadata.mockResolvedValue({ hasHarpocratesMetadata: true })
   vm.fetchProofEventsByVideo.mockResolvedValue([])
   vm.getOnChainProof.mockResolvedValue(null)
+  vm.getMetadataEnvelope.mockResolvedValue(null)
 })
 
 afterEach(() => {
@@ -147,6 +150,84 @@ describe('useVerification.verifyEvidence – harpocrates metadata found', () => 
       await result.current.verifyEvidence(makeVideoFile('old.mp4'))
     })
     expect(result.current.status).toBe('success')
+    expect(result.current.verifyResult).toMatch(/confirmed/i)
+  })
+})
+
+// ── metadata envelope comparison ────────────────────────────────────
+
+describe('useVerification – metadata envelope comparison', () => {
+  it('succeeds when envelope metadata hash matches extracted hash', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue({
+      version: 1,
+      metadataHash: 'b'.repeat(64),
+      boundAt: '1000',
+    })
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('success')
+    expect(result.current.errorCode).toBeNull()
+    expect(result.current.verifyResult).toMatch(/confirmed/i)
+  })
+
+  it('flags a distinct error code when envelope metadata hash mismatches', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue({
+      version: 1,
+      metadataHash: 'c'.repeat(64),
+      boundAt: '1000',
+    })
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('error')
+    expect(result.current.errorCode).toBe('METADATA_ENVELOPE_MISMATCH')
+    expect(result.current.verifyResult).toMatch(/envelope/i)
+  })
+
+  it('does not change behaviour when no envelope is bound', async () => {
+    const vm = await getVerifMock()
+    vm.fetchProofEventsByVideo.mockResolvedValue([
+      { id: 1, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' },
+    ])
+    vm.getOnChainProof.mockResolvedValue({
+      videoHash: 'a'.repeat(64),
+      metadataHash: 'b'.repeat(64),
+      tier: 1,
+      status: 1,
+      createdAt: '1000',
+      source: null,
+      issuer: null,
+    })
+    vm.getMetadataEnvelope.mockResolvedValue(null)
+    const { result } = renderHook(() => useVerification())
+    await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
+    expect(result.current.status).toBe('success')
+    expect(result.current.errorCode).toBeNull()
     expect(result.current.verifyResult).toMatch(/confirmed/i)
   })
 })
@@ -316,7 +397,7 @@ describe('useVerification – cancellation and race handling', () => {
     const vm = await getVerifMock()
     // Make extract hang until we cancel
     let resolveExtract: (v: unknown) => void
-    vm.extractMetadata.mockReturnValue(new Promise(res => { resolveExtract = res as any }))
+    vm.extractMetadata.mockReturnValue(new Promise((resolve) => { resolveExtract = resolve as (value: unknown) => void }))
     vm.fetchProofEventsByVideo.mockResolvedValue([])
     vm.getOnChainProof.mockResolvedValue(null)
 
@@ -342,8 +423,8 @@ describe('useVerification – cancellation and race handling', () => {
     const vm = await getVerifMock()
     let firstExtractResolve: (v: unknown) => void
     let firstDbResolve: (v: unknown) => void
-    vm.extractMetadata.mockImplementationOnce(() => new Promise(res => { firstExtractResolve = res as any }))
-    vm.fetchProofEventsByVideo.mockImplementationOnce(() => new Promise(res => { firstDbResolve = res as any }))
+    vm.extractMetadata.mockImplementationOnce(() => new Promise((resolve) => { firstExtractResolve = resolve as (value: unknown) => void }))
+    vm.fetchProofEventsByVideo.mockImplementationOnce(() => new Promise((resolve) => { firstDbResolve = resolve as (value: unknown) => void }))
     vm.getOnChainProof.mockResolvedValueOnce(null)
     // Second call: fast, will set different outcome
     const fastMeta = { hasHarpocratesMetadata: false }
@@ -378,7 +459,8 @@ describe('useVerification – cancellation and race handling', () => {
     vm.getOnChainProof.mockResolvedValueOnce(null)
     // retry will call again
     vm.extractMetadata.mockResolvedValueOnce({ hasHarpocratesMetadata: true })
-    vm.fetchProofEventsByVideo.mockResolvedValueOnce([{ id: 9, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' } as any])
+    const proofEvent = { id: 9, event_type: 'registered', file_name: null, video_hash: null, proof_id: null, tier: null, created_at: '' }
+    vm.fetchProofEventsByVideo.mockResolvedValueOnce([proofEvent as unknown as never])
     const { result } = renderHook(() => useVerification())
     await act(async () => { await result.current.verifyEvidence(makeVideoFile()) })
     expect(result.current.events).toHaveLength(0)
@@ -506,6 +588,7 @@ describe('useVerification – offline mode', () => {
     expect(vm.extractMetadata).not.toHaveBeenCalled()
     expect(vm.fetchProofEventsByVideo).not.toHaveBeenCalled()
     expect(vm.getOnChainProof).not.toHaveBeenCalled()
+    expect(vm.getMetadataEnvelope).not.toHaveBeenCalled()
   })
 
   it('reports tampered binding as invalid evidence in offline mode', async () => {
