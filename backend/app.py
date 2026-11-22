@@ -29,7 +29,7 @@ from http_security import (
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from dotenv import load_dotenv
-from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.exceptions import ClientDisconnected, RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
 from config import load_config
@@ -44,6 +44,7 @@ from errors import (
     NOT_FOUND,
     OVERSIZED_INPUT,
     PAYLOAD_TOO_LARGE,
+    UPLOAD_TERMINATED_PREMATURELY,
     RATE_LIMITED,
     UNSUPPORTED_INPUT,
     UNSUPPORTED_MEDIA_TYPE,
@@ -160,6 +161,7 @@ from errors import (
     INTERNAL_ERROR,
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
+    UPLOAD_TERMINATED_PREMATURELY,
     STEGO_LIMIT_EXCEEDED,
     VALIDATION_ERROR,
     error_response,
@@ -178,17 +180,27 @@ from tracing import (
 )
 from readiness import ReadinessManager
 from verifier_cache import VerifierCache
-from admission import AdmissionController, require_capacity
+from admission import (
+    AdmissionController,
+    AdmissionRejectedError,
+    _get_client_identity,
+    admit_verified_work,
+    require_capacity,
+)
 from webhook import WebhookWorker, queue_webhook_deliveries
 from quarantine import QuarantineError, isolate_upload, sniff_media_type_stream, sniff_media_type_path
 from strkey import validate_source_address, validate_contract_id
 from streaming_upload import (
+    PrematureUploadTerminationError,
+    ResumableUploadSessionStore,
+    SessionNotFoundError,
     StreamingFileStorage,
     UploadCancelledError,
     UploadSessionRegistry,
     UploadState,
     create_streaming_file_storage,
     hash_paths_concat,
+    resolve_temp_dir,
 )
 from werkzeug.datastructures import ImmutableMultiDict
 
@@ -446,6 +458,8 @@ def create_app() -> Flask:
         """Health and readiness probes must never be rate-limited."""
         return request.path in {"/health", "/ready"}
 
+    app.extensions["limiter"] = limiter
+
     init_db()
     init_retention_worker()
 
@@ -466,6 +480,12 @@ def create_app() -> Flask:
         timeout_seconds=config.admission_timeout_seconds,
     )
     upload_session_registry = UploadSessionRegistry()
+
+    upload_session_store = ResumableUploadSessionStore(
+        base_dir=resolve_temp_dir(getattr(config, "upload_temp_dir", None)) or tempfile.gettempdir(),
+        default_chunk_size=getattr(config, "upload_chunk_bytes", None),
+        default_max_size=getattr(config, "upload_max_bytes", None) if getattr(config, "upload_max_bytes", None) is not None else config.max_video_bytes,
+    )
 
     @app.before_request
     def start_request_context():
@@ -753,6 +773,22 @@ def create_app() -> Flask:
             status=413,
         )
 
+    @app.errorhandler(PrematureUploadTerminationError)
+    def upload_terminated_prematurely(error: PrematureUploadTerminationError):
+        return error_response(
+            code=error.code,
+            message=str(error),
+            status=error.status_code,
+        )
+
+    @app.errorhandler(ClientDisconnected)
+    def client_disconnected(_error: ClientDisconnected):
+        return error_response(
+            code=UPLOAD_TERMINATED_PREMATURELY,
+            message="upload terminated prematurely before completion",
+            status=400,
+        )
+
     @app.errorhandler(ValueError)
     def bad_request(error: ValueError):
         # Metadata failures carry a canonical taxonomy code; serialize them
@@ -984,6 +1020,16 @@ def create_app() -> Flask:
             ).decode("ascii")
         return response
 
+    def _extract_upload_session_auth() -> tuple[str | None, str | None]:
+        auth_header = request.headers.get("Authorization", "").strip()
+        token = None
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip() or None
+        if token is None:
+            token = (request.headers.get("X-Upload-Session-Token") or "").strip() or None
+        owner = (request.headers.get("X-Upload-Owner") or "").strip() or None
+        return token, owner
+
     @app.post("/api/stego/upload-session")
     @limiter.limit(config.ratelimit_upload_session)
     def create_upload_session():
@@ -1026,10 +1072,18 @@ def create_app() -> Flask:
             return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
         except RequestEntityTooLarge:
             return jsonify({"error": "chunk exceeds size limit"}), 413
+        except SessionNotFoundError:
+            return jsonify({"error": "session not found"}), 404
+        except UploadSessionError as exc:
+            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
+
         return jsonify({
             "ok": True,
-            "bytes": streaming_chunk.bytes_written,
-            "sha256": streaming_chunk.computed_hash,
+            "chunkIndex": progress.index,
+            "bytes": progress.bytes_written,
+            "sha256": progress.sha256,
+            "totalBytes": total_bytes,
+            "encrypted": True,
         })
 
     @app.post("/api/stego/upload-session/<session_id>/cancel")
@@ -1047,7 +1101,6 @@ def create_app() -> Flask:
 
     @app.post("/api/stego/upload-session/<session_id>/commit")
     @limiter.limit(config.ratelimit_upload_session)
-    @require_capacity(admission_controller)
     def commit_upload_session(session_id: str):
         session = upload_session_registry.get(session_id)
         if session is None:
@@ -1055,6 +1108,8 @@ def create_app() -> Flask:
         session_dir = session.session_dir
         if not session_dir.exists():
             return jsonify({"error": "session not found"}), 404
+        except UploadSessionError as exc:
+            return error_response(code=exc.code, message=str(exc), status=exc.status_code)
 
         admission_ticket = getattr(g, "admission_ticket", None)
         if admission_ticket is not None:
@@ -1103,26 +1158,44 @@ def create_app() -> Flask:
         except UploadCancelledError as exc:
             return jsonify({"error": str(exc), "code": exc.code}), exc.status_code
 
-        # Sniff assembled file before handing it to ffmpeg.
-        try:
-            sniff_media_type_path(combined_path)
-        except QuarantineError as exc:
-            return error_response(
-                code=UNSUPPORTED_MEDIA_TYPE,
-                message=str(exc),
-                status=400,
+            # Sniff assembled file before handing it to ffmpeg.
+            try:
+                sniff_media_type_path(combined_path)
+            except QuarantineError as exc:
+                return error_response(
+                    code=UNSUPPORTED_MEDIA_TYPE,
+                    message=str(exc),
+                    status=400,
+                )
+
+            retention_class = request.headers.get("X-Harpocrates-Retention-Class") or metadata.get("retentionClass", "default")
+            if retention_class not in config.retention_classes:
+                return jsonify({"error": f"invalid retention class: {retention_class}"}), 400
+
+            admission_identity = (
+                f"owner:{session.owner}" if session.owner else _get_client_identity()
             )
+            endpoint = request.url_rule.rule if request.url_rule else request.path
+            try:
+                with admit_verified_work(
+                    admission_controller,
+                    admission_identity,
+                    endpoint=endpoint,
+                ):
+                    output_path = Path(tmp_dir) / "embedded.mp4"
+                    embed_metadata(combined_path, output_path, metadata)
+                    output_bytes = output_path.read_bytes()
+                    embedded_hash = sha256_file(output_path)
+                    metadata_hash = canonical_metadata_hash(metadata)
+            except AdmissionRejectedError as exc:
+                response = jsonify({
+                    "error": "service overloaded",
+                    "reason": exc.reason,
+                })
+                response.status_code = exc.status_code
+                response.headers["Retry-After"] = str(exc.retry_after)
+                return response
 
-        with tempfile.TemporaryDirectory(prefix="harpocrates-") as tmp_dir:
-            output_path = Path(tmp_dir) / "embedded.mp4"
-            embed_metadata(combined_path, output_path, metadata)
-            output_bytes = output_path.read_bytes()
-            embedded_hash = sha256_file(output_path)
-            metadata_hash = canonical_metadata_hash(metadata)
-
-        retention_class = request.headers.get("X-Harpocrates-Retention-Class") or metadata.get("retentionClass", "default")
-        if retention_class not in config.retention_classes:
-            return jsonify({"error": f"invalid retention class: {retention_class}"}), 400
         retention_days = config.retention_classes[retention_class]
         expires_at = None
         if retention_days >= 0:

@@ -28,6 +28,10 @@ KNOWN_NETWORK_PASSPHRASES = {
 class RegistrationReconcileError(RuntimeError):
     pass
 
+DOMAIN_TAG = "harpocrates:registration-reconcile:v1"
+CHECKPOINT_VERSION = 1
+DEFAULT_CHECKPOINT_FILENAME = "registration-reconcile-checkpoint.json"
+DEFAULT_STATE_DIR = Path(tempfile.gettempdir()) / "harpocrates-registration-reconcile"
 
 class CheckpointError(RegistrationReconcileError):
     pass
