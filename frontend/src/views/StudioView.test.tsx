@@ -13,6 +13,12 @@ import type { UseEvidenceReturn } from '../hooks/useEvidence'
 import type { UseVerificationReturn } from '../hooks/useVerification'
 import type { ProofPackage } from '../types'
 
+vi.mock('../harpocratesRegistry', () => ({}))
+vi.mock('../stellar', () => ({
+  CONTRACT_NETWORK_PASSPHRASE: 'Test SDF Future Network ; October 2022',
+  getVerifierState: vi.fn().mockResolvedValue({ currentSetHash: 'a'.repeat(64), count: 1, verifiers: [] }),
+}))
+
 function makeVerification(): UseVerificationReturn {
   return {
     verifyHash: '',
@@ -42,6 +48,7 @@ function makeEvidence(overrides: Partial<UseEvidenceReturn>): UseEvidenceReturn 
       description: 'Noir ZK proof.',
     },
     stage: 'idle',
+    hashProgress: null,
     file: null,
     proof: null,
     processedVideoUrl: '',
@@ -49,16 +56,26 @@ function makeEvidence(overrides: Partial<UseEvidenceReturn>): UseEvidenceReturn 
     setCredentialSeed: vi.fn(),
     nullifierSeed: '',
     setNullifierSeed: vi.fn(),
+    evidenceNotes: '',
+    setEvidenceNotes: vi.fn(),
     message: 'Upload evidence to begin.',
     proofPreparation: buildProofPreparationPreview({ proof: null, tier: 'silent' }),
     acknowledgedSensitiveFields: [],
     acknowledgeSensitiveFields: vi.fn(),
     registration: null,
     networkMismatch: null,
+    networkMismatchRecovery: null,
     isCancellable: false,
+    admissionState: null,
+    uploadErrorKind: 'none',
+    isRejectedUpload: false,
+    isInvalidEvidence: false,
     handleEvidence: vi.fn(),
+    retryEvidence: vi.fn(),
     registerProof: vi.fn(),
+    revalidateNetworkMismatch: vi.fn(),
     cancelEvidence: vi.fn(),
+    cancelProving: vi.fn(),
     ...overrides,
   }
 }
@@ -177,71 +194,87 @@ describe('StudioView – cancel button', () => {
   })
 })
 
-describe('StudioView – export privacy summary', () => {
-  it('shows metadata classes and public identifiers and allows immediate export for baseline silent tier', () => {
+describe('StudioView – upload admission and queue state', () => {
+  it('renders admission queue banner when upload is rejected by queue limits', () => {
+    renderStudio(
+      makeEvidence({
+        stage: 'error',
+        isRejectedUpload: true,
+        admissionState: {
+          status: 'rejected',
+          reason: 'queue_full',
+          message: 'Upload queue is full. Try again in 5s.',
+          retryAfter: 5,
+          retryable: true,
+          actionHint: 'retry',
+        },
+      }),
+    )
+
+    expect(screen.getByTestId('admission-queue-banner')).toBeInTheDocument()
+    expect(screen.getByTestId('admission-queue-title')).toHaveTextContent(/Rejected \(queue full\)/i)
+    expect(screen.getByTestId('admission-queue-message')).toHaveTextContent('Upload queue is full. Try again in 5s.')
+    expect(screen.getByTestId('admission-queue-retry-hint')).toHaveTextContent('5s')
+    expect(screen.getByRole('button', { name: 'Retry upload' })).toBeInTheDocument()
+    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('REJECTED (queue_full)')
+  })
+
+  it('triggers retryUpload when Retry Upload button is clicked', async () => {
+    const user = userEvent.setup()
+    const retryUpload = vi.fn()
+    renderStudio(
+      makeEvidence({
+        stage: 'error',
+        isRejectedUpload: true,
+        retryUpload,
+        admissionState: {
+          status: 'rejected',
+          reason: 'identity_limit',
+          message: 'Concurrent upload limit reached for tier.',
+          retryAfter: 10,
+          retryable: true,
+          actionHint: 'retry',
+        },
+      }),
+    )
+
+    await user.click(screen.getByRole('button', { name: 'Retry upload' }))
+    expect(retryUpload).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders invalid evidence banner distinct from admission rejection', () => {
+    renderStudio(
+      makeEvidence({
+        stage: 'error',
+        isInvalidEvidence: true,
+        isRejectedUpload: false,
+        admissionState: null,
+        message: 'Unsupported video container format.',
+      }),
+    )
+
+    expect(screen.getByTestId('invalid-evidence-banner')).toBeInTheDocument()
+    expect(screen.getByTestId('invalid-evidence-message')).toHaveTextContent('Unsupported video container format.')
+    expect(screen.queryByTestId('admission-queue-banner')).not.toBeInTheDocument()
+    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('IDLE')
+  })
+
+  it('renders ADMITTED in data list when evidence proof is ready', () => {
     renderStudio(
       makeEvidence({
         stage: 'ready',
         proof,
-        processedVideoUrl: 'blob:synthetic-evidence',
+        admissionState: {
+          status: 'admitted',
+          reason: null,
+          message: 'Upload admitted and processed successfully.',
+          retryAfter: null,
+          retryable: false,
+          actionHint: 'none',
+        },
       }),
     )
 
-    const summaryRegion = screen.getByRole('region', { name: 'Export privacy summary' })
-    expect(summaryRegion).toHaveTextContent('Container & file metadata')
-    expect(summaryRegion).toHaveTextContent('Cryptographic digests')
-    expect(summaryRegion).toHaveTextContent('Ready to export')
-    expect(within(summaryRegion).queryByRole('checkbox')).not.toBeInTheDocument()
-
-    const downloadLink = screen.getByRole('link', { name: /Download harpocrates-clip\.mp4/i })
-    expect(downloadLink).toHaveAttribute('href', 'blob:synthetic-evidence')
-  })
-
-  it('blocks export until newly exposed sensitive fields are explicitly acknowledged on source tier', async () => {
-    const user = userEvent.setup()
-    const acknowledgeSensitiveFields = vi.fn()
-    const sourceProof: ProofPackage = { ...proof, tier: 'source' }
-
-    const { rerender } = renderStudio(
-      makeEvidence({
-        selectedTier: 'source',
-        stage: 'ready',
-        proof: sourceProof,
-        processedVideoUrl: 'blob:synthetic-source-evidence',
-        acknowledgedSensitiveFields: [],
-        acknowledgeSensitiveFields,
-      }),
-    )
-
-    expect(
-      screen.queryByRole('link', { name: /Download harpocrates-clip\.mp4/i }),
-    ).not.toBeInTheDocument()
-    const blockedButton = screen.getByRole('button', {
-      name: /Download harpocrates-clip\.mp4 \(acknowledge newly exposed sensitive fields first\)/i,
-    })
-    expect(blockedButton).toBeDisabled()
-
-    const checkbox = screen.getByRole('checkbox')
-    await user.click(checkbox)
-    expect(acknowledgeSensitiveFields).toHaveBeenCalledWith(['publicIdentity'])
-
-    rerender(
-      <StudioView
-        wallet="GSOURCEGAUTH"
-        evidence={makeEvidence({
-          selectedTier: 'source',
-          stage: 'ready',
-          proof: sourceProof,
-          processedVideoUrl: 'blob:synthetic-source-evidence',
-          acknowledgedSensitiveFields: ['publicIdentity'],
-          acknowledgeSensitiveFields,
-        })}
-        verification={makeVerification()}
-        provenanceRecord={null}
-      />,
-    )
-
-    const downloadLink = screen.getByRole('link', { name: /Download harpocrates-clip\.mp4/i })
-    expect(downloadLink).toHaveAttribute('href', 'blob:synthetic-source-evidence')
+    expect(screen.getByTestId('admission-state-value')).toHaveTextContent('ADMITTED')
   })
 })

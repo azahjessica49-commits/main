@@ -485,6 +485,35 @@ def _call_transport(
         return transport(deployment)
     return transport()
 
+DOMAIN_TAG = "harpocrates:registration-reconcile:v1"
+CHECKPOINT_VERSION = 1
+DEFAULT_CHECKPOINT_FILENAME = "registration-reconcile-checkpoint.json"
+DEFAULT_STATE_DIR = Path(tempfile.gettempdir()) / "harpocrates-registration-reconcile"
+
+def _resolve_observed_digest(
+    registered_statement: dict[str, Any] | None,
+    verification: TxVerificationResult,
+) -> tuple[str | None, str | None]:
+    """Return ``(digest, error_reason)`` for the on-chain registered statement."""
+    candidate_statement = (
+        registered_statement
+        if registered_statement is not None
+        else verification.registered_statement
+    )
+    if candidate_statement is not None:
+        try:
+            return compute_intent_digest(candidate_statement), None
+        except ValueError:
+            return None, "registered_statement_invalid"
+
+    if verification.registered_intent_digest is not None:
+        try:
+            return normalize_intent_digest(verification.registered_intent_digest), None
+        except ValueError:
+            return None, "registered_statement_invalid"
+
+    return None, None
+
 
 def reconcile_registration(
     store: CheckpointStore | str | os.PathLike[str],

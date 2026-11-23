@@ -68,6 +68,14 @@ Run the Vitest and React Testing Library suite:
 npm test
 ```
 
+## Evidence Studio & Recovery
+
+The Evidence Studio (`useEvidence` hook and `StudioView`) allows users to upload source videos, configure identity tiers, and record evidence notes:
+
+- **Evidence Notes Preservation**: Original user-entered evidence notes (`evidenceNotes`) are maintained in memory across recoverable API failures (such as steganography service timeouts or temporary 5xx errors).
+- **Stale Server Result Guard**: In-flight server requests cannot overwrite user edits made in the UI during or after a recoverable failure.
+- **Reviewed File Identity**: The retry action (`retryEvidence`) is strictly tied to the reviewed file identity (matching file name, size, and last modified timestamp). If a user selects a different file, previous notes are safely reset for the new file context.
+
 ## Browser storage policy
 
 All application-owned browser persistence must go through the wrappers in
@@ -75,7 +83,20 @@ All application-owned browser persistence must go through the wrappers in
 
 - `currentView`: the active navigation view
 - `selectedTier`: the active identity-tier selection
+- `vaultRecoveryRehearsed`: flag indicating whether the one-time vault recovery rehearsal has completed
 
 Credential or nullifier seeds, proof witnesses, generated proofs, raw private
 inputs, and every other field are prohibited from both `localStorage` and
 `sessionStorage`. Keep secret proof-generation data in memory only.
+
+## Cross-tab vault change detection & recovery
+
+The client-side credential vault (`src/credentialVault.ts`) and safe-storage wrappers (`src/safeStorage.ts`) provide explicit cross-tab vault change detection:
+
+- **Stale view invalidation**: When another browser tab modifies, replaces, or removes the encrypted vault envelope in `localStorage`, any currently unlocked vault view in other tabs is immediately invalidated (`isStale(): true`). Active seeds and cryptographic keys in memory are quarantined and access via `getSeeds()` fails-closed (`null`) to prevent accidental generation of stale proof witnesses.
+- **Active work preservation**: In-progress witness material and user-registered session work are preserved in a quarantined recovery record (`getPreservedWork()`) and protected against inactivity auto-lock until the user selects an explicit recovery action.
+- **Explicit recovery actions**:
+  - `reload`: Discards the local stale session, reloads from storage, and prompts for the new vault passphrase (or unlocks directly if supplied).
+  - `overwrite`: Re-encrypts the preserved active work into browser storage under a new passphrase, restoring the session to a valid unlocked state.
+  - `discard`: Discards and zeroes out the quarantined active work and cleanly locks the vault.
+- **React integration**: `useCredentialVault` and `<VaultRecoveryBanner />` surface real-time stale notifications and recovery controls with accessible ARIA announcements.
