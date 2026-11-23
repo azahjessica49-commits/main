@@ -8,6 +8,27 @@ from typing import Any, Callable, Tuple
 
 from cryptography.fernet import Fernet
 import db
+import storage
+from storage import _parse_timestamp
+
+DEFAULT_VERIFY_BATCH_SIZE = 50
+MAX_VERIFY_BATCH_SIZE = 500
+PROGRESS_SCHEMA_VERSION = 1
+
+STATUS_VERIFIED = "verified"
+STATUS_FAILED = "failed"
+STATUS_UNVERIFIABLE_LEGACY = "unverifiable_legacy"
+
+ENVELOPE_VERSION_FERNET_V1 = "fernet-v1"
+DEFAULT_ENVELOPE_VERSION = ENVELOPE_VERSION_FERNET_V1
+SUPPORTED_ENVELOPE_VERSIONS: frozenset[str] = frozenset({ENVELOPE_VERSION_FERNET_V1})
+KNOWN_LEGACY_ENVELOPE_VERSIONS: frozenset[str] = frozenset({"legacy-v0", "fernet-v0"})
+
+ENVELOPE_CLASS_SUPPORTED = "supported"
+ENVELOPE_CLASS_LEGACY = "legacy"
+ENVELOPE_CLASS_UNSUPPORTED = "unsupported"
+
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 STORAGE_METADATA_ERROR_CODE = "DEPENDENCY_UNAVAILABLE"
 STORAGE_METADATA_ERROR_STATUS = 503
@@ -41,6 +62,52 @@ class BlobCollectionResult:
     storage_path: str | None = None
     attempts: int = 1
 
+EXPORT_MANIFEST_VERSION = 1
+DEFAULT_ENVELOPE_VERSION = "fernet-v1"
+_HEX_32_PATTERN = re.compile(r"[0-9a-fA-F]{64}")
+
+
+class UnsupportedEnvelopeVersionError(ValueError):
+    """Raised when an encryption envelope version is unknown or unsupported."""
+
+
+class LegacyEnvelopeVersionError(ValueError):
+    """Raised when a known legacy envelope version cannot be decrypted directly."""
+
+
+def classify_envelope_version(envelope_version: object) -> str:
+    """Classify an encryption envelope version as supported, known legacy, or unsupported.
+
+    A ``None`` value represents a pre-versioning legacy metadata row and is
+    classified as ``legacy``. Explicit legacy identifiers in
+    ``KNOWN_LEGACY_ENVELOPE_VERSIONS`` are also classified as ``legacy``.
+    Any other unrecognized, empty, or non-string value is ``unsupported``.
+    """
+    if envelope_version is None:
+        return ENVELOPE_CLASS_LEGACY
+    if not isinstance(envelope_version, str):
+        return ENVELOPE_CLASS_UNSUPPORTED
+    normalized = envelope_version.strip()
+    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_SUPPORTED
+    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_LEGACY
+    return ENVELOPE_CLASS_UNSUPPORTED
+
+
+def validate_envelope_version(envelope_version: object) -> str:
+    """Validate and return a supported envelope version for new evidence blobs."""
+    if not isinstance(envelope_version, str):
+        raise UnsupportedEnvelopeVersionError("envelope_version must be a supported string identifier")
+    normalized = envelope_version.strip()
+    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
+        return normalized
+    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
+        raise LegacyEnvelopeVersionError(
+            f"legacy envelope_version {normalized!r} cannot be used for new evidence blobs"
+        )
+    raise UnsupportedEnvelopeVersionError(f"unsupported envelope_version: {envelope_version!r}")
+
 
 def generate_dek() -> Tuple[bytes, bytes]:
     """Generates a Data Encryption Key (DEK) and its encrypted form (using a Master Key)."""
@@ -55,28 +122,65 @@ def generate_dek() -> Tuple[bytes, bytes]:
     return dek, encrypted_dek
 
 
-def decrypt_dek(encrypted_dek: bytes) -> bytes:
-    master_key_b64 = os.getenv("MASTER_ENCRYPTION_KEY")
-    if not master_key_b64:
-        raise ValueError("MASTER_ENCRYPTION_KEY is not set")
-    f = Fernet(master_key_b64.encode())
-    return f.decrypt(encrypted_dek)
+class LegacyEnvelopeVersionError(ValueError):
+    """Raised when a known legacy envelope version cannot be decrypted directly."""
 
 
-def get_encryptor(dek: bytes):
-    return Fernet(dek)
+def get_encryptor(dek: bytes, envelope_version: str = DEFAULT_ENVELOPE_VERSION):
+    validated = validate_envelope_version(envelope_version)
+    if validated == ENVELOPE_VERSION_FERNET_V1:
+        return Fernet(dek)
+    raise UnsupportedEnvelopeVersionError(f"unsupported envelope_version: {envelope_version!r}")
 
 
-def record_blob(content_hash: str, encrypted_dek: bytes, size_bytes: int, storage_path: str):
+def decrypt_blob_ciphertext(
+    dek: bytes,
+    ciphertext: bytes,
+    *,
+    envelope_version: object = DEFAULT_ENVELOPE_VERSION,
+) -> bytes:
+    """Decrypt blob ciphertext using only the algorithm declared by ``envelope_version``.
+
+    Never inspects or guesses a decryption algorithm from malformed ciphertext.
+    A ``None`` ``envelope_version`` represents a pre-versioning legacy Fernet
+    row and is decrypted strictly with Fernet (no fallback). Explicit known
+    legacy versions raise ``LegacyEnvelopeVersionError``; unknown or malformed
+    version identifiers raise ``UnsupportedEnvelopeVersionError``.
+    """
+    if envelope_version is None:
+        return Fernet(dek).decrypt(ciphertext)
+
+    classification = classify_envelope_version(envelope_version)
+    if classification == ENVELOPE_CLASS_SUPPORTED:
+        normalized = envelope_version.strip()  # type: ignore[union-attr]
+        if normalized == ENVELOPE_VERSION_FERNET_V1:
+            return Fernet(dek).decrypt(ciphertext)
+    if classification == ENVELOPE_CLASS_LEGACY:
+        raise LegacyEnvelopeVersionError(
+            f"known legacy envelope_version cannot be decrypted directly: {envelope_version!r}"
+        )
+    raise UnsupportedEnvelopeVersionError(
+        f"unsupported envelope_version: {envelope_version!r}"
+    )
+
+
+def record_blob(
+    content_hash: str,
+    encrypted_dek: bytes,
+    size_bytes: int,
+    storage_path: str,
+    envelope_version: str = DEFAULT_ENVELOPE_VERSION,
+):
+    validated_version = validate_envelope_version(envelope_version)
     with db.get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path)
-                values (%s, %s, %s, %s)
+                insert into blobs (content_hash, encrypted_dek, size_bytes, storage_path, envelope_version)
+                values (%s, %s, %s, %s, %s)
                 on conflict (content_hash) do nothing
                 """,
-                (content_hash, encrypted_dek.decode(), size_bytes, storage_path)
+                (content_hash, encrypted_dek.decode(), size_bytes, storage_path, validated_version),
             )
         conn.commit()
 
@@ -160,6 +264,34 @@ def remove_tenant_ref(tenant_id: str, content_hash: str) -> bool:
     return True
 
 
+def _audit_ref(content_hash: str) -> str:
+    """Return a non-reversible audit reference for a blob without exposing its hash."""
+    return hashlib.sha256(("audit:" + content_hash).encode("utf-8")).hexdigest()[:32]
+
+
+def record_deletion_receipt(receipt_id: str, phase: str, selected: list, completed: list):
+    """Persist a two-phase deletion receipt.
+
+    phase 'approved' records the selection before any storage action runs.
+    phase 'completed' records audit references for storage actions that finished.
+    Only audit references are stored: no content hashes, storage paths, or keys.
+    """
+    with db.get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                insert into blob_deletion_receipts (receipt_id, phase, selected_refs, completed_refs)
+                values (%s, %s, %s, %s)
+                on conflict (receipt_id) do update
+                set phase = excluded.phase,
+                    completed_refs = excluded.completed_refs,
+                    updated_at = now()
+                """,
+                (receipt_id, phase, ",".join(selected), ",".join(completed))
+            )
+        conn.commit()
+
+
 def collect_unreferenced_blobs(limit: int = 100) -> int:
     """Transactionally delete blob rows and files that have zero references.
 
@@ -168,12 +300,23 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
     is left intact so the deletion will be retried on the next run.
     Deletions are recorded in metrics without exposing content hashes.
     """
-    if limit < 1:
-        return 0
+    if envelope_version is None:
+        return ENVELOPE_CLASS_LEGACY
+    if not isinstance(envelope_version, str):
+        return ENVELOPE_CLASS_UNSUPPORTED
+    normalized = envelope_version.strip()
+    if normalized in SUPPORTED_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_SUPPORTED
+    if normalized in KNOWN_LEGACY_ENVELOPE_VERSIONS:
+        return ENVELOPE_CLASS_LEGACY
+    return ENVELOPE_CLASS_UNSUPPORTED
 
     collected = 0
     with db.get_connection() as conn:
         with conn.cursor() as cursor:
+            receipt_id = uuid.uuid4().hex
+            selected_refs: list = []
+            completed_refs: list = []
             cursor.execute(
                 """
                 select content_hash, storage_path
@@ -197,6 +340,7 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
             for row in rows:
                 content_hash = row["content_hash"] if isinstance(row, dict) else row[0]
                 storage_path = row["storage_path"] if isinstance(row, dict) else row[1]
+                selected_refs.append(_audit_ref(content_hash))
 
                 # Attempt file deletion first
                 try:
@@ -214,6 +358,7 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
                     continue
 
                 cursor.execute("delete from blobs where content_hash = %s", (content_hash,))
+                completed_refs.append(_audit_ref(content_hash))
                 collected += 1
 
         conn.commit()
@@ -231,7 +376,10 @@ def collect_unreferenced_blobs(limit: int = 100) -> int:
 def get_blob_info(content_hash: str) -> dict | None:
     with db.get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("select encrypted_dek, storage_path from blobs where content_hash = %s", (content_hash,))
+            cursor.execute(
+                "select encrypted_dek, storage_path, envelope_version from blobs where content_hash = %s",
+                (content_hash,),
+            )
             row = cursor.fetchone()
             return dict(row) if row else None
 
