@@ -159,6 +159,7 @@ class AdmissionTicket:
 class AdmissionController:
     """
     Manages capacity and queue limits, providing backpressure via admission control.
+    Also tracks per-identity temporary upload storage budget reservations.
     """
 
     def __init__(
@@ -167,11 +168,13 @@ class AdmissionController:
         max_queue: int,
         max_per_identity: int,
         timeout_seconds: float,
+        max_temp_storage_per_identity: int | None = None,
     ):
         self.max_concurrent = max_concurrent
         self.max_queue = max_queue
         self.max_per_identity = max_per_identity
         self.timeout_seconds = timeout_seconds
+        self.max_temp_storage_per_identity = max_temp_storage_per_identity
 
         self._lock = threading.Lock()
         self._current_queue = 0
@@ -350,6 +353,9 @@ def require_capacity(controller: AdmissionController):
     """
     Flask decorator to enforce admission control on a route.
     Returns 429 or 503 with a Retry-After header on rejection.
+    If the decorated route processes an upload session (session_id in kwargs or
+    view_args), marks the session as active while processing so retention
+    sweeps avoid deleting chunks referenced by active workers.
     """
 
     def decorator(f):
@@ -380,3 +386,37 @@ def require_capacity(controller: AdmissionController):
                     controller.release(identity)
         return wrapped
     return decorator
+
+
+@contextmanager
+def admit_verified_work(
+    controller: AdmissionController,
+    identity: str,
+    *,
+    endpoint: str | None = None,
+) -> Iterator[None]:
+    """Acquire an admission slot for *identity* after pre-flight verification.
+
+    Use this instead of ``@require_capacity`` when a request must first pass
+    authentication and content-hash verification before consuming processing
+    capacity.  Raises ``AdmissionRejectedError`` on backpressure.
+    """
+    acquired, reason = controller.acquire(identity)
+    if not acquired:
+        try:
+            from metrics import collector as metrics_collector
+
+            metrics_collector.record_rejection(reason, endpoint or "verified_work")
+        except Exception:
+            pass
+        status_code = 429 if reason == "identity_limit" else 503
+        retry_after = int(controller.timeout_seconds * 2) or 5
+        raise AdmissionRejectedError(
+            reason=reason,
+            status_code=status_code,
+            retry_after=retry_after,
+        )
+    try:
+        yield
+    finally:
+        controller.release(identity)
